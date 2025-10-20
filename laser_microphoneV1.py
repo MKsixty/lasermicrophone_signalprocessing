@@ -20,6 +20,30 @@ import json
 import traceback
 import subprocess
 
+
+def is_ffmpeg_available(exec_path=None):
+    """Return True if ffmpeg is callable.
+
+    If exec_path is provided and points to an executable, that will be used.
+    Otherwise the function attempts to call 'ffmpeg' on PATH.
+    """
+    try:
+        if exec_path:
+            # If provided a directory, look for ffmpeg.exe inside it
+            if os.path.isdir(exec_path):
+                cand = os.path.join(exec_path, 'ffmpeg.exe')
+            else:
+                cand = exec_path
+            if not os.path.exists(cand):
+                return False
+            result = subprocess.run([cand, '-version'], capture_output=True, timeout=5)
+            return result.returncode == 0
+        else:
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+            return result.returncode == 0
+    except Exception:
+        return False
+
 # Check PyQt6 import first
 try:
     from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -320,11 +344,13 @@ class TranscriptionThread(QThread):
     progress_update = pyqtSignal(int)
     error_occurred = pyqtSignal(str)
     
-    def __init__(self, audio_file, methods=['vosk'], vosk_model='vosk-model-small-en-us-0.15'):
+    def __init__(self, audio_file, methods=['vosk'], vosk_model='vosk-model-small-en-us-0.15', whisper_model='small', ffmpeg_path=None):
         super().__init__()
         self.audio_file = audio_file
         self.methods = methods
         self.vosk_model = vosk_model
+        self.whisper_model = whisper_model
+        self.ffmpeg_path = ffmpeg_path
         self.converted_file = None
     
     def run(self):
@@ -354,26 +380,31 @@ class TranscriptionThread(QThread):
         """Convert audio to 16kHz mono WAV for transcription compatibility"""
         try:
             temp_dir = os.path.dirname(input_file)
-            temp_file = os.path.join(temp_dir, f"temp_16khz_{os.path.basename(input_file)}")
+            base_name = os.path.splitext(os.path.basename(input_file))[0]
+            temp_file = os.path.join(temp_dir, f"temp_16khz_{base_name}.wav")
             
-            # Check if ffmpeg is available
-            try:
-                result = subprocess.run(['ffmpeg', '-version'], 
-                                      capture_output=True, 
-                                      timeout=5)
-                ffmpeg_available = result.returncode == 0
-            except:
-                ffmpeg_available = False
-            
+            # Check if ffmpeg is available (use provided path if given)
+            ffmpeg_available = is_ffmpeg_available(self.ffmpeg_path)
+
             if ffmpeg_available:
+                # Resolve ffmpeg executable to call
+                if self.ffmpeg_path:
+                    if os.path.isdir(self.ffmpeg_path):
+                        ffmpeg_exec = os.path.join(self.ffmpeg_path, 'ffmpeg.exe')
+                    else:
+                        ffmpeg_exec = self.ffmpeg_path
+                else:
+                    ffmpeg_exec = 'ffmpeg'
+
                 cmd = [
-                    'ffmpeg', '-i', input_file,
+                    ffmpeg_exec, '-i', input_file,
                     '-ar', '16000',
                     '-ac', '1',
+                    '-f', 'wav',
                     '-y',
                     temp_file
                 ]
-                
+
                 subprocess.run(cmd, capture_output=True, check=True, timeout=60)
                 print(f"✓ Converted audio to 16kHz using ffmpeg: {temp_file}")
                 return temp_file
@@ -383,18 +414,18 @@ class TranscriptionThread(QThread):
                 if not SCIPY_AVAILABLE:
                     print("⚠ scipy not available, using original file")
                     return input_file
-                
+
                 sample_rate, data = wavfile.read(input_file)
-                
+
                 if len(data.shape) > 1:
                     data = data.mean(axis=1).astype(data.dtype)
-                
+
                 if sample_rate != 16000:
                     from scipy import signal as sp_signal
                     num_samples = int(len(data) * 16000 / sample_rate)
                     data = sp_signal.resample(data, num_samples)
                     data = data.astype(np.int16)
-                
+
                 wavfile.write(temp_file, 16000, data)
                 print(f"✓ Converted audio to 16kHz using scipy: {temp_file}")
                 return temp_file
@@ -463,12 +494,27 @@ class TranscriptionThread(QThread):
         try:
             recognizer = sr.Recognizer()
             audio_file = self.converted_file if self.converted_file else self.audio_file
-            
+            # Validate that audio_file is a readable WAV with suitable parameters
+            try:
+                # Try open with wave to detect common format issues
+                with wave.open(audio_file, 'rb') as wf:
+                    nch = wf.getnchannels()
+                    sampw = wf.getsampwidth()
+                    fr = wf.getframerate()
+            except Exception as e:
+                self.error_occurred.emit(f"SpeechRecognition: cannot open audio file: {e}\nEnsure ffmpeg or SciPy is installed to convert files to 16kHz mono WAV.")
+                return
+
+            # If not mono 16-bit, try to convert (scipy fallback already attempted in convert_audio_to_16khz)
+            if nch != 1 or sampw != 2 or fr not in [8000, 16000, 32000, 48000]:
+                # Still try to proceed since sr.AudioFile can handle some rates, but warn
+                print(f"SpeechRecognition: audio format is nch={nch}, sampw={sampw}, fr={fr}. Proceeding but results may vary.")
+
             with sr.AudioFile(audio_file) as source:
                 audio = recognizer.record(source)
-            
+
             self.progress_update.emit(66)
-            
+
             try:
                 transcription = recognizer.recognize_google(audio)
                 self.progress_update.emit(100)
@@ -477,7 +523,7 @@ class TranscriptionThread(QThread):
                 self.transcription_ready.emit('sr', "[Could not understand audio]")
                 self.progress_update.emit(100)
             except sr.RequestError as e:
-                self.error_occurred.emit(f"Speech Recognition error: {e}")
+                self.error_occurred.emit(f"Speech Recognition request error: {e}\nEnsure you have network connectivity for Google SR.")
         
         except Exception as e:
             self.error_occurred.emit(f"Speech Recognition error: {str(e)}")
@@ -488,13 +534,73 @@ class TranscriptionThread(QThread):
             self.progress_update.emit(70)
             
             print("Loading Whisper model (this may take a moment)...")
-            model = whisper.load_model("small")
+            # Use the selected whisper model name passed to the thread
+            model_name = getattr(self, 'whisper_model', 'small')
+
+            # Check ffmpeg availability because whisper uses ffmpeg for many formats
+            if not is_ffmpeg_available(self.ffmpeg_path):
+                # If the converted file exists and is a WAV, whisper can still read it; otherwise fail fast
+                audio_candidate = self.converted_file if self.converted_file else self.audio_file
+                try:
+                    with wave.open(audio_candidate, 'rb') as wf:
+                        pass
+                except Exception:
+                    self.error_occurred.emit("Whisper requires ffmpeg or a valid converted WAV. Provide an ffmpeg path in the Transcription Settings or install ffmpeg on PATH.")
+                    return
+
+            model = None
+            try:
+                # Ensure ffmpeg path (if provided) is on PATH temporarily for whisper internals
+                if self.ffmpeg_path and os.path.exists(self.ffmpeg_path):
+                    old_path = os.environ.get('PATH', '')
+                    if os.path.isdir(self.ffmpeg_path):
+                        ff_dir = self.ffmpeg_path
+                    else:
+                        ff_dir = os.path.dirname(self.ffmpeg_path)
+                    os.environ['PATH'] = ff_dir + os.pathsep + old_path
+                    try:
+                        model = whisper.load_model(model_name)
+                    finally:
+                        os.environ['PATH'] = old_path
+                else:
+                    model = whisper.load_model(model_name)
+            except FileNotFoundError as e:
+                # Likely missing model files or download failure
+                self.error_occurred.emit(f"Whisper model load error: {e}. Check model name and internet access to download models.")
+                return
+            except Exception as e:
+                self.error_occurred.emit(f"Whisper load_model error: {e}")
+                return
             
             self.progress_update.emit(80)
             
             audio_file = self.converted_file if self.converted_file else self.audio_file
-            
-            result = model.transcribe(audio_file, fp16=False)
+            # Ensure the audio file exists and is readable
+            if not os.path.exists(audio_file):
+                self.error_occurred.emit(f"Whisper error: converted audio file not found: {audio_file}")
+                return
+
+            try:
+                if self.ffmpeg_path and os.path.exists(self.ffmpeg_path):
+                    old_path = os.environ.get('PATH', '')
+                    if os.path.isdir(self.ffmpeg_path):
+                        ff_dir = self.ffmpeg_path
+                    else:
+                        ff_dir = os.path.dirname(self.ffmpeg_path)
+                    os.environ['PATH'] = ff_dir + os.pathsep + old_path
+                    try:
+                        result = model.transcribe(audio_file, fp16=False)
+                    finally:
+                        os.environ['PATH'] = old_path
+                else:
+                    result = model.transcribe(audio_file, fp16=False)
+            except FileNotFoundError as e:
+                # This commonly indicates ffmpeg is missing on Windows (WinError 2)
+                self.error_occurred.emit("Whisper error: ffmpeg not found on PATH. Install ffmpeg and restart the app. See https://ffmpeg.org/download.html")
+                return
+            except Exception as e:
+                self.error_occurred.emit(f"Whisper error: {str(e)}")
+                return
             
             transcription = result['text'].strip()
             if not transcription:
@@ -757,8 +863,12 @@ class LaserMicrophoneApp(QMainWindow):
         status_text += f"• Matplotlib: {'✓' if MATPLOTLIB_AVAILABLE else '✗'}\n"
         status_text += f"• Vosk: {'✓' if VOSK_AVAILABLE else '✗'}\n"
         status_text += f"• SpeechRecognition: {'✓' if SR_AVAILABLE else '✗'}\n"
-        status_text += f"• Whisper: {'✓' if WHISPER_AVAILABLE else '✗'}"
-        stats_layout.addWidget(QLabel(status_text))
+        status_text += f"• Whisper: {'✓' if WHISPER_AVAILABLE else '✗'}\n"
+        # FFmpeg availability on PATH (initial check)
+        ff_on_path = is_ffmpeg_available(None)
+        status_text += f"• FFmpeg on PATH: {'✓' if ff_on_path else '✗'}"
+        self.ffmpeg_status_label = QLabel(status_text)
+        stats_layout.addWidget(self.ffmpeg_status_label)
         
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
@@ -931,10 +1041,49 @@ class LaserMicrophoneApp(QMainWindow):
         self.whisper_checkbox.setEnabled(WHISPER_AVAILABLE)
         model_layout.addWidget(self.whisper_checkbox)
         
+        # Whisper model selector (small / medium)
+        if WHISPER_AVAILABLE:
+            whisper_model_layout = QHBoxLayout()
+            whisper_model_label = QLabel("Whisper Model:")
+            whisper_model_layout.addWidget(whisper_model_label)
+            self.whisper_model_combo = QComboBox()
+            self.whisper_model_combo.addItem("small", "small")
+            self.whisper_model_combo.addItem("medium", "medium")
+            self.whisper_model_combo.setCurrentIndex(0)
+            whisper_model_layout.addWidget(self.whisper_model_combo)
+            model_layout.addLayout(whisper_model_layout)
+
         if not WHISPER_AVAILABLE:
             whisper_info = QLabel("Install Whisper: pip install openai-whisper")
             whisper_info.setStyleSheet("color: #888; font-size: 9px;")
             model_layout.addWidget(whisper_info)
+        
+        # FFmpeg path entry (optional) - allows using a local ffmpeg binary that's not on PATH
+        ffmpeg_layout = QHBoxLayout()
+        ffmpeg_label = QLabel("FFmpeg path (optional):")
+        ffmpeg_layout.addWidget(ffmpeg_label)
+        self.ffmpeg_input = QLineEdit()
+        self.ffmpeg_input.setPlaceholderText("C:\\path\\to\\ffmpeg.exe or folder containing ffmpeg.exe")
+        ffmpeg_layout.addWidget(self.ffmpeg_input)
+        ffmpeg_check_btn = QPushButton("Check")
+        def _check_ffmpeg():
+            p = self.ffmpeg_input.text().strip()
+            ok = is_ffmpeg_available(p if p else None)
+            QMessageBox.information(self, "FFmpeg Check", f"FFmpeg available: {ok}\nPath checked: {p if p else 'system PATH'}")
+            # Update status label in Session Stats if present
+            try:
+                ff_on_path = is_ffmpeg_available(None)
+                if hasattr(self, 'ffmpeg_status_label'):
+                    prev = self.ffmpeg_status_label.text().split('\n')
+                    # replace last line with FFmpeg status
+                    if prev:
+                        prev[-1] = f"• FFmpeg on PATH: {'✓' if ff_on_path else '✗'}"
+                        self.ffmpeg_status_label.setText('\n'.join(prev))
+            except Exception:
+                pass
+        ffmpeg_check_btn.clicked.connect(_check_ffmpeg)
+        ffmpeg_layout.addWidget(ffmpeg_check_btn)
+        model_layout.addLayout(ffmpeg_layout)
         
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
@@ -1420,7 +1569,9 @@ class LaserMicrophoneApp(QMainWindow):
         self.transcribe_thread = TranscriptionThread(
             self.selected_recording['filename'], 
             methods,
-            self.selected_vosk_model
+            self.selected_vosk_model,
+            whisper_model=(self.whisper_model_combo.currentData() if WHISPER_AVAILABLE else 'small'),
+            ffmpeg_path=(self.ffmpeg_input.text().strip() if hasattr(self, 'ffmpeg_input') else None)
         )
         self.transcribe_thread.transcription_ready.connect(self.on_transcription_ready)
         self.transcribe_thread.progress_update.connect(self.transcribe_progress.setValue)
