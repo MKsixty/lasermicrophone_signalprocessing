@@ -6,9 +6,10 @@ Enhanced Features:
 - Live listening with filtering and volume control (1-10x amplification)
 - Audio visualization (waveform, spectrogram)
 - Multiple Vosk model support with selection
-- Side-by-side transcription (Vosk + Speech Recognition)
+- Side-by-side transcription (Vosk + Speech Recognition + Whisper)
+- Automatic 16kHz conversion for transcription
 - Recording upload functionality
-- Working playback feature
+- Working playback feature with timeline
 - Recording history management
 - Export functionality
 """
@@ -17,6 +18,7 @@ import sys
 import os
 import json
 import traceback
+import subprocess
 
 # Check PyQt6 import first
 try:
@@ -89,6 +91,14 @@ try:
 except ImportError:
     SR_AVAILABLE = False
     print("WARNING: speech_recognition not available")
+
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+    print("✓ OpenAI Whisper loaded successfully")
+except ImportError:
+    WHISPER_AVAILABLE = False
+    print("WARNING: OpenAI Whisper not available. Install with: pip install openai-whisper")
 
 
 # Available Vosk models
@@ -315,16 +325,83 @@ class TranscriptionThread(QThread):
         self.audio_file = audio_file
         self.methods = methods
         self.vosk_model = vosk_model
+        self.converted_file = None
     
     def run(self):
         try:
+            # Convert audio to 16kHz mono WAV for compatibility
+            self.converted_file = self.convert_audio_to_16khz(self.audio_file)
+            
             for method in self.methods:
                 if method == 'vosk' and VOSK_AVAILABLE:
                     self.transcribe_vosk()
                 elif method == 'sr' and SR_AVAILABLE:
                     self.transcribe_speech_recognition()
+                elif method == 'whisper' and WHISPER_AVAILABLE:
+                    self.transcribe_whisper()
+            
+            # Clean up converted file
+            if self.converted_file and self.converted_file != self.audio_file and os.path.exists(self.converted_file):
+                try:
+                    os.remove(self.converted_file)
+                except:
+                    pass
+                    
         except Exception as e:
             self.error_occurred.emit(str(e))
+    
+    def convert_audio_to_16khz(self, input_file):
+        """Convert audio to 16kHz mono WAV for transcription compatibility"""
+        try:
+            temp_dir = os.path.dirname(input_file)
+            temp_file = os.path.join(temp_dir, f"temp_16khz_{os.path.basename(input_file)}")
+            
+            # Check if ffmpeg is available
+            try:
+                result = subprocess.run(['ffmpeg', '-version'], 
+                                      capture_output=True, 
+                                      timeout=5)
+                ffmpeg_available = result.returncode == 0
+            except:
+                ffmpeg_available = False
+            
+            if ffmpeg_available:
+                cmd = [
+                    'ffmpeg', '-i', input_file,
+                    '-ar', '16000',
+                    '-ac', '1',
+                    '-y',
+                    temp_file
+                ]
+                
+                subprocess.run(cmd, capture_output=True, check=True, timeout=60)
+                print(f"✓ Converted audio to 16kHz using ffmpeg: {temp_file}")
+                return temp_file
+            else:
+                print("⚠ ffmpeg not found, using scipy for conversion...")
+                
+                if not SCIPY_AVAILABLE:
+                    print("⚠ scipy not available, using original file")
+                    return input_file
+                
+                sample_rate, data = wavfile.read(input_file)
+                
+                if len(data.shape) > 1:
+                    data = data.mean(axis=1).astype(data.dtype)
+                
+                if sample_rate != 16000:
+                    from scipy import signal as sp_signal
+                    num_samples = int(len(data) * 16000 / sample_rate)
+                    data = sp_signal.resample(data, num_samples)
+                    data = data.astype(np.int16)
+                
+                wavfile.write(temp_file, 16000, data)
+                print(f"✓ Converted audio to 16kHz using scipy: {temp_file}")
+                return temp_file
+                
+        except Exception as e:
+            print(f"Audio conversion error: {e}, using original file")
+            return input_file
     
     def transcribe_vosk(self):
         """Transcribe using Vosk offline"""
@@ -339,11 +416,12 @@ class TranscriptionThread(QThread):
         
         try:
             model = Model(model_path)
+            audio_file = self.converted_file if self.converted_file else self.audio_file
+            wf = wave.open(audio_file, "rb")
             
-            # Read audio file
-            wf = wave.open(self.audio_file, "rb")
+            if wf.getframerate() != 16000:
+                print(f"⚠ Warning: Vosk expects 16kHz audio, got {wf.getframerate()}Hz")
             
-            # Create recognizer with correct sample rate
             rec = KaldiRecognizer(model, wf.getframerate())
             rec.SetWords(True)
             
@@ -357,7 +435,7 @@ class TranscriptionThread(QThread):
                     break
                 
                 frames_read += 4000
-                progress = int((frames_read / total_frames) * 50)  # 0-50% for Vosk
+                progress = int((frames_read / total_frames) * 33)
                 self.progress_update.emit(progress)
                 
                 if rec.AcceptWaveform(data):
@@ -365,7 +443,6 @@ class TranscriptionThread(QThread):
                     if 'text' in result and result['text']:
                         results.append(result['text'])
             
-            # Final result
             final_result = json.loads(rec.FinalResult())
             if 'text' in final_result and final_result['text']:
                 results.append(final_result['text'])
@@ -385,11 +462,12 @@ class TranscriptionThread(QThread):
         """Transcribe using Python Speech Recognition"""
         try:
             recognizer = sr.Recognizer()
+            audio_file = self.converted_file if self.converted_file else self.audio_file
             
-            with sr.AudioFile(self.audio_file) as source:
+            with sr.AudioFile(audio_file) as source:
                 audio = recognizer.record(source)
             
-            self.progress_update.emit(75)
+            self.progress_update.emit(66)
             
             try:
                 transcription = recognizer.recognize_google(audio)
@@ -403,6 +481,30 @@ class TranscriptionThread(QThread):
         
         except Exception as e:
             self.error_occurred.emit(f"Speech Recognition error: {str(e)}")
+    
+    def transcribe_whisper(self):
+        """Transcribe using OpenAI Whisper"""
+        try:
+            self.progress_update.emit(70)
+            
+            print("Loading Whisper model (this may take a moment)...")
+            model = whisper.load_model("small")
+            
+            self.progress_update.emit(80)
+            
+            audio_file = self.converted_file if self.converted_file else self.audio_file
+            
+            result = model.transcribe(audio_file, fp16=False)
+            
+            transcription = result['text'].strip()
+            if not transcription:
+                transcription = "[No speech detected by Whisper]"
+            
+            self.progress_update.emit(100)
+            self.transcription_ready.emit('whisper', transcription)
+        
+        except Exception as e:
+            self.error_occurred.emit(f"Whisper error: {str(e)}")
 
 
 if MATPLOTLIB_AVAILABLE:
@@ -424,7 +526,6 @@ class LaserMicrophoneApp(QMainWindow):
         self.setGeometry(100, 100, 1400, 900)
         self.setStyleSheet(self.get_stylesheet())
         
-        # Initialize PyAudio if available
         self.audio_devices = []
         self.selected_device = 0
         
@@ -440,32 +541,29 @@ class LaserMicrophoneApp(QMainWindow):
             self.p = None
             print("WARNING: PyAudio not available - recording features disabled")
         
-        # Recording state
         self.recorder = None
         self.live_processor = None
         self.is_recording = False
         self.is_live_listening = False
         
-        # Media player for playback
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.positionChanged.connect(self.on_playback_position_changed)
+        self.media_player.durationChanged.connect(self.on_playback_duration_changed)
+        self.is_playing = False
         
-        # Recordings database
         self.recordings_dir = "recordings"
         os.makedirs(self.recordings_dir, exist_ok=True)
         self.recordings = self.load_recordings()
         
-        # Filter settings
         self.filter_enabled = True
         self.lowcut = 300
         self.highcut = 3400
         self.volume_multiplier = 1.0
         
-        # Vosk model selection
         self.selected_vosk_model = 'vosk-model-small-en-us-0.15'
         
-        # Initialize UI
         try:
             self.init_ui()
             print("✓ UI initialized successfully")
@@ -473,7 +571,6 @@ class LaserMicrophoneApp(QMainWindow):
             print(f"ERROR initializing UI: {e}")
             traceback.print_exc()
         
-        # Recording timer
         self.recording_timer = QTimer()
         self.recording_timer.timeout.connect(self.update_recording_time)
         self.recording_duration = 0
@@ -524,11 +621,9 @@ class LaserMicrophoneApp(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         
-        # Left panel - Controls
         left_panel = self.create_left_panel()
         main_layout.addWidget(left_panel, 1)
         
-        # Right panel - Content
         right_panel = self.create_right_panel()
         main_layout.addWidget(right_panel, 3)
     
@@ -537,13 +632,11 @@ class LaserMicrophoneApp(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         
-        # Header
         header = QLabel("🎤 Laser Microphone")
         header.setFont(QFont("Arial", 16, QFont.Weight.Bold))
         header.setStyleSheet("color: #a855f7; padding: 10px;")
         layout.addWidget(header)
         
-        # Device selection
         device_group = QGroupBox("Audio Input Device")
         device_layout = QVBoxLayout()
         self.device_combo = QComboBox()
@@ -560,18 +653,15 @@ class LaserMicrophoneApp(QMainWindow):
         device_group.setLayout(device_layout)
         layout.addWidget(device_group)
         
-        # Recording controls
         recording_group = QGroupBox("Recording")
         recording_layout = QVBoxLayout()
         
-        # Recording name
         name_label = QLabel("Recording Name:")
         recording_layout.addWidget(name_label)
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Enter recording name...")
         recording_layout.addWidget(self.name_input)
         
-        # Filter controls
         filter_layout = QHBoxLayout()
         self.filter_checkbox = QCheckBox("Bandpass Filter")
         self.filter_checkbox.setChecked(True)
@@ -579,7 +669,6 @@ class LaserMicrophoneApp(QMainWindow):
         filter_layout.addWidget(self.filter_checkbox)
         recording_layout.addLayout(filter_layout)
         
-        # Filter parameters
         freq_layout = QVBoxLayout()
         
         lowcut_layout = QHBoxLayout()
@@ -606,15 +695,14 @@ class LaserMicrophoneApp(QMainWindow):
         
         recording_layout.addLayout(freq_layout)
         
-        # Volume control for live listening
         volume_layout = QVBoxLayout()
         volume_label = QLabel(f"Volume Amplification: {self.volume_multiplier:.1f}x")
         self.volume_amp_label = volume_label
         volume_layout.addWidget(volume_label)
         
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.setMinimum(10)  # 1.0x
-        self.volume_slider.setMaximum(100)  # 10.0x
+        self.volume_slider.setMinimum(10)
+        self.volume_slider.setMaximum(100)
         self.volume_slider.setValue(10)
         self.volume_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.volume_slider.setTickInterval(10)
@@ -622,21 +710,18 @@ class LaserMicrophoneApp(QMainWindow):
         volume_layout.addWidget(self.volume_slider)
         recording_layout.addLayout(volume_layout)
         
-        # Volume meter
         self.volume_label = QLabel("Input Level: 0%")
         recording_layout.addWidget(self.volume_label)
         self.volume_bar = QProgressBar()
         self.volume_bar.setMaximum(100)
         recording_layout.addWidget(self.volume_bar)
         
-        # Recording time
         self.time_label = QLabel("00:00")
         self.time_label.setFont(QFont("Arial", 24, QFont.Weight.Bold))
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.time_label.setStyleSheet("color: #a855f7;")
         recording_layout.addWidget(self.time_label)
         
-        # Record button
         self.record_btn = QPushButton("🔴 Start Recording")
         self.record_btn.clicked.connect(self.toggle_recording)
         self.record_btn.setMinimumHeight(50)
@@ -645,7 +730,6 @@ class LaserMicrophoneApp(QMainWindow):
             self.record_btn.setText("PyAudio Required")
         recording_layout.addWidget(self.record_btn)
         
-        # Live listening button
         self.live_btn = QPushButton("🔊 Start Live Listening")
         self.live_btn.clicked.connect(self.toggle_live_listening)
         self.live_btn.setMinimumHeight(40)
@@ -657,7 +741,6 @@ class LaserMicrophoneApp(QMainWindow):
         recording_group.setLayout(recording_layout)
         layout.addWidget(recording_group)
         
-        # Session stats
         stats_group = QGroupBox("Session Stats")
         stats_layout = QVBoxLayout()
         
@@ -668,13 +751,13 @@ class LaserMicrophoneApp(QMainWindow):
         stats_layout.addWidget(QLabel("Bit Depth: 16-bit"))
         stats_layout.addWidget(QLabel("Format: WAV Mono"))
         
-        # Library status
         status_text = "\nLibrary Status:\n"
         status_text += f"• PyAudio: {'✓' if PYAUDIO_AVAILABLE else '✗'}\n"
         status_text += f"• SciPy: {'✓' if SCIPY_AVAILABLE else '✗'}\n"
         status_text += f"• Matplotlib: {'✓' if MATPLOTLIB_AVAILABLE else '✗'}\n"
         status_text += f"• Vosk: {'✓' if VOSK_AVAILABLE else '✗'}\n"
-        status_text += f"• SpeechRecognition: {'✓' if SR_AVAILABLE else '✗'}"
+        status_text += f"• SpeechRecognition: {'✓' if SR_AVAILABLE else '✗'}\n"
+        status_text += f"• Whisper: {'✓' if WHISPER_AVAILABLE else '✗'}"
         stats_layout.addWidget(QLabel(status_text))
         
         stats_group.setLayout(stats_layout)
@@ -689,18 +772,14 @@ class LaserMicrophoneApp(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         
-        # Tabs
         self.tabs = QTabWidget()
         
-        # Recordings tab
         recordings_tab = self.create_recordings_tab()
         self.tabs.addTab(recordings_tab, "📁 Recordings")
         
-        # Visualize tab
         visualize_tab = self.create_visualize_tab()
         self.tabs.addTab(visualize_tab, "📊 Visualize")
         
-        # Transcribe tab
         transcribe_tab = self.create_transcribe_tab()
         self.tabs.addTab(transcribe_tab, "📝 Transcribe")
         
@@ -713,13 +792,37 @@ class LaserMicrophoneApp(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Recordings list
         self.recordings_list = QListWidget()
         self.recordings_list.itemClicked.connect(self.on_recording_selected)
         self.update_recordings_list()
         layout.addWidget(self.recordings_list)
         
-        # Buttons
+        playback_group = QGroupBox("Playback Controls")
+        playback_layout = QVBoxLayout()
+        
+        time_layout = QHBoxLayout()
+        self.current_time_label = QLabel("00:00")
+        self.current_time_label.setStyleSheet("color: #a855f7; font-weight: bold;")
+        time_layout.addWidget(self.current_time_label)
+        
+        time_layout.addStretch()
+        
+        self.total_time_label = QLabel("00:00")
+        self.total_time_label.setStyleSheet("color: #888;")
+        time_layout.addWidget(self.total_time_label)
+        playback_layout.addLayout(time_layout)
+        
+        self.playback_slider = QSlider(Qt.Orientation.Horizontal)
+        self.playback_slider.setMinimum(0)
+        self.playback_slider.setMaximum(1000)
+        self.playback_slider.setValue(0)
+        self.playback_slider.sliderMoved.connect(self.on_playback_slider_moved)
+        self.playback_slider.setEnabled(False)
+        playback_layout.addWidget(self.playback_slider)
+        
+        playback_group.setLayout(playback_layout)
+        layout.addWidget(playback_group)
+        
         btn_layout = QHBoxLayout()
         
         upload_btn = QPushButton("📤 Upload")
@@ -729,6 +832,10 @@ class LaserMicrophoneApp(QMainWindow):
         play_btn = QPushButton("▶ Play")
         play_btn.clicked.connect(self.play_recording)
         btn_layout.addWidget(play_btn)
+        
+        pause_btn = QPushButton("⏸ Pause")
+        pause_btn.clicked.connect(self.pause_playback)
+        btn_layout.addWidget(pause_btn)
         
         stop_btn = QPushButton("⏹ Stop")
         stop_btn.clicked.connect(self.stop_playback)
@@ -756,7 +863,6 @@ class LaserMicrophoneApp(QMainWindow):
         layout = QVBoxLayout(tab)
         
         if MATPLOTLIB_AVAILABLE and SCIPY_AVAILABLE:
-            # Waveform plot
             waveform_label = QLabel("Waveform")
             waveform_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
             layout.addWidget(waveform_label)
@@ -764,7 +870,6 @@ class LaserMicrophoneApp(QMainWindow):
             self.waveform_canvas = MplCanvas(self, width=8, height=3, dpi=100)
             layout.addWidget(self.waveform_canvas)
             
-            # Spectrogram plot
             spectrogram_label = QLabel("Spectrogram")
             spectrogram_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
             layout.addWidget(spectrogram_label)
@@ -772,7 +877,6 @@ class LaserMicrophoneApp(QMainWindow):
             self.spectrogram_canvas = MplCanvas(self, width=8, height=3, dpi=100)
             layout.addWidget(self.spectrogram_canvas)
             
-            # Load button
             load_btn = QPushButton("Load Selected Recording for Visualization")
             load_btn.clicked.connect(self.visualize_selected)
             layout.addWidget(load_btn)
@@ -791,11 +895,9 @@ class LaserMicrophoneApp(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Model selection section
         model_group = QGroupBox("Transcription Settings")
         model_layout = QVBoxLayout()
         
-        # Vosk model selection
         if VOSK_AVAILABLE:
             vosk_label = QLabel("Vosk Model:")
             model_layout.addWidget(vosk_label)
@@ -807,12 +909,10 @@ class LaserMicrophoneApp(QMainWindow):
             self.vosk_model_combo.currentIndexChanged.connect(self.on_vosk_model_changed)
             model_layout.addWidget(self.vosk_model_combo)
             
-            # Model info
             self.model_info_label = QLabel()
             self.update_model_info()
             model_layout.addWidget(self.model_info_label)
         
-        # Transcription method checkboxes
         method_label = QLabel("Transcription Methods:")
         model_layout.addWidget(method_label)
         
@@ -826,23 +926,29 @@ class LaserMicrophoneApp(QMainWindow):
         self.sr_checkbox.setEnabled(SR_AVAILABLE)
         model_layout.addWidget(self.sr_checkbox)
         
+        self.whisper_checkbox = QCheckBox("OpenAI Whisper small (Offline - Best Quality)")
+        self.whisper_checkbox.setChecked(False)
+        self.whisper_checkbox.setEnabled(WHISPER_AVAILABLE)
+        model_layout.addWidget(self.whisper_checkbox)
+        
+        if not WHISPER_AVAILABLE:
+            whisper_info = QLabel("Install Whisper: pip install openai-whisper")
+            whisper_info.setStyleSheet("color: #888; font-size: 9px;")
+            model_layout.addWidget(whisper_info)
+        
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
         
-        # Progress bar
         self.transcribe_progress = QProgressBar()
         layout.addWidget(self.transcribe_progress)
         
-        # Transcription display - side by side
         transcribe_label = QLabel("Transcriptions:")
         transcribe_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         layout.addWidget(transcribe_label)
         
-        # Create horizontal layout for side-by-side transcriptions
         transcribe_container = QWidget()
         transcribe_layout = QHBoxLayout(transcribe_container)
         
-        # Vosk transcription
         vosk_group = QGroupBox("Vosk Transcription")
         vosk_layout = QVBoxLayout()
         self.vosk_text = QTextEdit()
@@ -852,7 +958,6 @@ class LaserMicrophoneApp(QMainWindow):
         vosk_group.setLayout(vosk_layout)
         transcribe_layout.addWidget(vosk_group)
         
-        # Speech Recognition transcription
         sr_group = QGroupBox("Google Speech Recognition")
         sr_layout = QVBoxLayout()
         self.sr_text = QTextEdit()
@@ -862,9 +967,17 @@ class LaserMicrophoneApp(QMainWindow):
         sr_group.setLayout(sr_layout)
         transcribe_layout.addWidget(sr_group)
         
+        whisper_group = QGroupBox("OpenAI Whisper")
+        whisper_layout = QVBoxLayout()
+        self.whisper_text = QTextEdit()
+        self.whisper_text.setReadOnly(True)
+        self.whisper_text.setPlaceholderText("Whisper transcription will appear here...")
+        whisper_layout.addWidget(self.whisper_text)
+        whisper_group.setLayout(whisper_layout)
+        transcribe_layout.addWidget(whisper_group)
+        
         layout.addWidget(transcribe_container)
         
-        # Buttons
         btn_layout = QHBoxLayout()
         
         start_transcribe_btn = QPushButton("🎙 Start Transcription")
@@ -879,9 +992,13 @@ class LaserMicrophoneApp(QMainWindow):
         export_sr_btn.clicked.connect(lambda: self.export_transcription('sr'))
         btn_layout.addWidget(export_sr_btn)
         
-        export_both_btn = QPushButton("💾 Export Both")
-        export_both_btn.clicked.connect(lambda: self.export_transcription('both'))
-        btn_layout.addWidget(export_both_btn)
+        export_whisper_btn = QPushButton("💾 Export Whisper")
+        export_whisper_btn.clicked.connect(lambda: self.export_transcription('whisper'))
+        btn_layout.addWidget(export_whisper_btn)
+        
+        export_all_btn = QPushButton("💾 Export All")
+        export_all_btn.clicked.connect(lambda: self.export_transcription('all'))
+        btn_layout.addWidget(export_all_btn)
         
         layout.addLayout(btn_layout)
         
@@ -946,11 +1063,9 @@ class LaserMicrophoneApp(QMainWindow):
             return
         
         try:
-            # Generate filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = os.path.join(self.recordings_dir, f"{name}_{timestamp}.wav")
             
-            # Start recorder thread
             self.recorder = AudioRecorder(self.selected_device)
             self.recorder.set_filter(self.filter_enabled, self.lowcut, self.highcut)
             self.recorder.filename = filename
@@ -959,13 +1074,11 @@ class LaserMicrophoneApp(QMainWindow):
             self.recorder.error_occurred.connect(self.on_error)
             self.recorder.start()
             
-            # Update UI
             self.is_recording = True
             self.record_btn.setText("⏹ Stop Recording")
             self.record_btn.setStyleSheet("background-color: #dc2626;")
             self.name_input.setEnabled(False)
             
-            # Start timer
             self.recording_duration = 0
             self.recording_timer.start(1000)
         
@@ -1051,7 +1164,8 @@ class LaserMicrophoneApp(QMainWindow):
             'lowcut': self.lowcut if self.filter_enabled else None,
             'highcut': self.highcut if self.filter_enabled else None,
             'vosk_transcription': '',
-            'sr_transcription': ''
+            'sr_transcription': '',
+            'whisper_transcription': ''
         }
         
         self.recordings.append(recording_data)
@@ -1092,18 +1206,15 @@ class LaserMicrophoneApp(QMainWindow):
         
         if filename:
             try:
-                # Copy file to recordings directory
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 base_name = os.path.splitext(os.path.basename(filename))[0]
                 new_filename = os.path.join(self.recordings_dir, f"{base_name}_{timestamp}.wav")
                 shutil.copy(filename, new_filename)
                 
-                # Get audio info
                 wf = wave.open(new_filename, 'rb')
                 duration = wf.getnframes() / wf.getframerate()
                 wf.close()
                 
-                # Add to database
                 recording_data = {
                     'name': base_name,
                     'filename': new_filename,
@@ -1113,7 +1224,8 @@ class LaserMicrophoneApp(QMainWindow):
                     'lowcut': None,
                     'highcut': None,
                     'vosk_transcription': '',
-                    'sr_transcription': ''
+                    'sr_transcription': '',
+                    'whisper_transcription': ''
                 }
                 
                 self.recordings.append(recording_data)
@@ -1138,18 +1250,59 @@ class LaserMicrophoneApp(QMainWindow):
                 QMessageBox.warning(self, "Error", "Recording file not found")
                 return
             
-            # Play using QMediaPlayer
             self.media_player.setSource(QUrl.fromLocalFile(file_path))
             self.media_player.play()
-            
-            QMessageBox.information(self, "Playing", f"Playing: {self.selected_recording['name']}")
+            self.is_playing = True
+            self.playback_slider.setEnabled(True)
         
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to play recording: {str(e)}")
     
+    def pause_playback(self):
+        """Pause audio playback"""
+        if self.is_playing:
+            self.media_player.pause()
+            self.is_playing = False
+        else:
+            self.media_player.play()
+            self.is_playing = True
+    
     def stop_playback(self):
         """Stop audio playback"""
         self.media_player.stop()
+        self.is_playing = False
+        self.playback_slider.setValue(0)
+        self.playback_slider.setEnabled(False)
+        self.current_time_label.setText("00:00")
+        self.total_time_label.setText("00:00")
+    
+    def on_playback_position_changed(self, position):
+        """Update playback position"""
+        if not self.playback_slider.isSliderDown():
+            duration = self.media_player.duration()
+            if duration > 0:
+                slider_position = int((position / duration) * 1000)
+                self.playback_slider.setValue(slider_position)
+        
+        self.current_time_label.setText(self.format_time(position))
+    
+    def on_playback_duration_changed(self, duration):
+        """Update total duration"""
+        self.total_time_label.setText(self.format_time(duration))
+    
+    def on_playback_slider_moved(self, position):
+        """Handle slider movement"""
+        duration = self.media_player.duration()
+        if duration > 0:
+            new_position = int((position / 1000) * duration)
+            self.media_player.setPosition(new_position)
+    
+    def format_time(self, milliseconds):
+        """Format time in milliseconds to MM:SS"""
+        seconds = int(milliseconds / 1000)
+        mins = seconds // 60
+        secs = seconds % 60
+        return f"{mins:02d}:{secs:02d}"
     
     def transcribe_selected(self):
         """Switch to transcribe tab"""
@@ -1188,11 +1341,9 @@ class LaserMicrophoneApp(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            # Remove file
             if os.path.exists(self.selected_recording['filename']):
                 os.remove(self.selected_recording['filename'])
             
-            # Remove from database
             self.recordings = [r for r in self.recordings 
                              if r['filename'] != self.selected_recording['filename']]
             self.save_recordings()
@@ -1212,10 +1363,8 @@ class LaserMicrophoneApp(QMainWindow):
             return
         
         try:
-            # Load audio file
             sample_rate, data = wavfile.read(self.selected_recording['filename'])
             
-            # Plot waveform
             self.waveform_canvas.axes.clear()
             time = np.arange(len(data)) / sample_rate
             self.waveform_canvas.axes.plot(time, data, color='#a855f7', linewidth=0.5)
@@ -1226,7 +1375,6 @@ class LaserMicrophoneApp(QMainWindow):
             self.waveform_canvas.axes.grid(True, alpha=0.3)
             self.waveform_canvas.draw()
             
-            # Plot spectrogram
             self.spectrogram_canvas.axes.clear()
             f, t, Sxx = signal.spectrogram(data, sample_rate)
             self.spectrogram_canvas.axes.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-10), 
@@ -1248,23 +1396,27 @@ class LaserMicrophoneApp(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select a recording first")
             return
         
-        # Determine which methods to use
         methods = []
         if self.vosk_checkbox.isChecked() and VOSK_AVAILABLE:
             methods.append('vosk')
         if self.sr_checkbox.isChecked() and SR_AVAILABLE:
             methods.append('sr')
+        if self.whisper_checkbox.isChecked() and WHISPER_AVAILABLE:
+            methods.append('whisper')
         
         if not methods:
             QMessageBox.warning(self, "Error", "Please select at least one transcription method")
             return
         
-        # Clear previous transcriptions
         self.vosk_text.clear()
         self.sr_text.clear()
+        self.whisper_text.clear()
         self.transcribe_progress.setValue(0)
         
-        # Start transcription thread
+        QMessageBox.information(self, "Transcription Started", 
+                               "Audio will be automatically converted to 16kHz mono for optimal transcription.\n\n" +
+                               "This may take a moment depending on the file size and selected methods.")
+        
         self.transcribe_thread = TranscriptionThread(
             self.selected_recording['filename'], 
             methods,
@@ -1279,27 +1431,32 @@ class LaserMicrophoneApp(QMainWindow):
         """Handle completed transcription"""
         if method == 'vosk':
             self.vosk_text.setText(text)
-            # Save to recording
             for rec in self.recordings:
                 if rec['filename'] == self.selected_recording['filename']:
                     rec['vosk_transcription'] = text
                     break
         elif method == 'sr':
             self.sr_text.setText(text)
-            # Save to recording
             for rec in self.recordings:
                 if rec['filename'] == self.selected_recording['filename']:
                     rec['sr_transcription'] = text
                     break
+        elif method == 'whisper':
+            self.whisper_text.setText(text)
+            for rec in self.recordings:
+                if rec['filename'] == self.selected_recording['filename']:
+                    rec['whisper_transcription'] = text
+                    break
         
         self.save_recordings()
     
-    def export_transcription(self, export_type='both'):
+    def export_transcription(self, export_type='all'):
         """Export transcription to text file"""
         vosk_text = self.vosk_text.toPlainText()
         sr_text = self.sr_text.toPlainText()
+        whisper_text = self.whisper_text.toPlainText()
         
-        if not vosk_text and not sr_text:
+        if not vosk_text and not sr_text and not whisper_text:
             QMessageBox.warning(self, "Error", "No transcription to export")
             return
         
@@ -1310,14 +1467,27 @@ class LaserMicrophoneApp(QMainWindow):
         )
         
         if filename:
-            with open(filename, 'w') as f:
-                if export_type == 'vosk' or export_type == 'both':
-                    f.write("=== VOSK TRANSCRIPTION ===\n\n")
-                    f.write(vosk_text + "\n\n")
+            with open(filename, 'w', encoding='utf-8') as f:
+                if export_type == 'vosk' or export_type == 'all':
+                    if vosk_text:
+                        f.write("=" * 60 + "\n")
+                        f.write("VOSK TRANSCRIPTION\n")
+                        f.write("=" * 60 + "\n\n")
+                        f.write(vosk_text + "\n\n")
                 
-                if export_type == 'sr' or export_type == 'both':
-                    f.write("=== GOOGLE SPEECH RECOGNITION ===\n\n")
-                    f.write(sr_text + "\n")
+                if export_type == 'sr' or export_type == 'all':
+                    if sr_text:
+                        f.write("=" * 60 + "\n")
+                        f.write("GOOGLE SPEECH RECOGNITION\n")
+                        f.write("=" * 60 + "\n\n")
+                        f.write(sr_text + "\n\n")
+                
+                if export_type == 'whisper' or export_type == 'all':
+                    if whisper_text:
+                        f.write("=" * 60 + "\n")
+                        f.write("OPENAI WHISPER\n")
+                        f.write("=" * 60 + "\n\n")
+                        f.write(whisper_text + "\n")
             
             QMessageBox.information(self, "Success", f"Exported to: {filename}")
     
