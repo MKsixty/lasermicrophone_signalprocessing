@@ -1,9 +1,9 @@
-%% Advanced Speech Enhancement with Wiener Filter
-% Tests multiple algorithms BEFORE amplification to find best buzz removal
+%% Advanced Speech Enhancement with Adaptive Amplitude Restoration
+% Tests multiple algorithms with dynamic amplitude restoration
 clear; clc; close all;
 
 %% Load and prepare audio
-[x, fs] = audioread('Final.wav');
+[x, fs] = audioread('2m.m4a');
 fprintf('File fs = %d Hz\n', fs); 
 
 % Convert to mono
@@ -15,10 +15,15 @@ end
 x = x / max(abs(x));
 audiowrite('stage_0_original.wav', x, fs);
 
+% Calculate original signal statistics
+original_rms = rms(x);
+original_peak = max(abs(x));
+fprintf('Original Signal - RMS: %.4f, Peak: %.4f\n', original_rms, original_peak);
+
 %% STAGE 1: Ultra-Clean Bandpass Filter
 fprintf('\n=== Stage 1: Bandpass Filtering ===\n');
 
-f_low = 300;   
+f_low = 100;   
 f_high = 3400; 
 
 % Very high order for extremely smooth transitions
@@ -79,7 +84,6 @@ for i = 1:num_frames
     frame_phase = angle(frame_fft);
     
     % Wiener filter gain
-    % H(f) = max(0, 1 - noise_power / signal_power)
     wiener_gain = max(0, 1 - noise_power ./ (frame_power + eps));
     
     % Apply gain smoothing to reduce musical noise
@@ -175,25 +179,34 @@ x_ss = x_ss / max(abs(x_ss)) * 0.95;
 audiowrite('stage_2b_spectral_subtraction.wav', x_ss, fs);
 fprintf('✓ Spectral subtraction complete\n');
 
-%% STAGE 2C: Adaptive Spectral Gating (AI-Inspired Approach)
+%% STAGE 2C: Adaptive Spectral Gating 
 fprintf('\n=== Stage 2C: Adaptive Spectral Gating ===\n');
 
-% This mimics AI behavior by learning noise characteristics adaptively
 frame_size = round(0.020 * fs);
 hop_size = round(0.010 * fs);
 win = hann(frame_size, 'periodic');
 nfft = 2^nextpow2(frame_size * 2);
 
-% Learn noise profile from multiple segments (like AI training)
-noise_learning_duration = min(1.0, length(x_bp)/fs * 0.2); % 1 sec or 20% of audio
-noise_frames = round(noise_learning_duration * fs / hop_size);
+% Learn noise profile starting from 0.03s to avoid initial spikes
+noise_start_time = 0.03; % Start at 30ms to skip initial artifacts
+noise_start_sample = round(noise_start_time * fs);
+
+% Learn from longer duration for 2-min audio: use 5 seconds or 5% of audio
+noise_learning_duration = min(5.0, length(x_bp)/fs * 0.05);
+noise_learning_samples = round(noise_learning_duration * fs);
+noise_end_sample = min(noise_start_sample + noise_learning_samples, length(x_bp));
+
+noise_frames = floor((noise_end_sample - noise_start_sample - frame_size) / hop_size);
+
+fprintf('  Noise learning: %.2fs to %.2fs (%.2f seconds)\n', ...
+        noise_start_time, noise_end_sample/fs, noise_learning_duration);
 
 % Estimate noise statistics with variance
 noise_mean = zeros(nfft, 1);
 noise_var = zeros(nfft, 1);
 
 for i = 1:noise_frames
-    idx = (i-1) * hop_size + 1;
+    idx = noise_start_sample + (i-1) * hop_size;
     if idx + frame_size - 1 > length(x_bp), break; end
     
     frame = x_bp(idx:idx+frame_size-1) .* win;
@@ -207,13 +220,13 @@ noise_mean = noise_mean / noise_frames;
 noise_var = (noise_var / noise_frames) - noise_mean.^2;
 noise_std = sqrt(max(noise_var, eps));
 
-% Process with adaptive threshold (AI-inspired)
+% Process with adaptive threshold
 num_frames = floor((length(x_bp) - frame_size) / hop_size) + 1;
 x_adaptive = zeros(length(x_bp), 1);
 window_sum = zeros(length(x_bp), 1);
 
-% Adaptive parameters (learned from data)
-sensitivity = 2.5; % Threshold sensitivity
+% Adaptive parameters
+sensitivity = 2.5;
 smoothing_frames = 3;
 gate_buffer = zeros(nfft, smoothing_frames);
 buffer_idx = 1;
@@ -227,13 +240,13 @@ for i = 1:num_frames
     frame_mag = abs(frame_fft);
     frame_phase = angle(frame_fft);
     
-    % Adaptive gate: speech-likely regions get gain > 1, noise gets < 1
+    % Adaptive gate
     snr_estimate = (frame_mag - noise_mean) ./ (noise_std + eps);
     
-    % Soft gating function (sigmoid-like, mimics neural activation)
+    % Soft gating function
     gate = 1 ./ (1 + exp(-sensitivity * (snr_estimate - 1)));
     
-    % Temporal smoothing (like RNN memory)
+    % Temporal smoothing 
     gate_buffer(:, buffer_idx) = gate;
     buffer_idx = mod(buffer_idx, smoothing_frames) + 1;
     
@@ -254,43 +267,86 @@ for i = 1:num_frames
 end
 
 x_adaptive = x_adaptive ./ max(window_sum, eps);
-x_adaptive = x_adaptive / max(abs(x_adaptive)) * 0.95;
+
+% Smart amplitude restoration using threshold-based approach
+% Calculate noise threshold from first 0.5s (starting at 0.03s to avoid spikes)
+threshold_start = round(0.03 * fs);
+threshold_end = min(round(0.5 * fs), length(x_adaptive));
+noise_section = x_adaptive(threshold_start:threshold_end);
+noise_threshold = max(abs(noise_section)) * 1.5; % 1.5x max of noise section
+
+fprintf('  Noise threshold: %.4f\n', noise_threshold);
+
+% Find signal peak using 99.5th percentile (to ignore outlier spikes)
+sorted_abs = sort(abs(x_adaptive));
+percentile_idx = round(0.995 * length(sorted_abs));
+signal_peak_99p5 = sorted_abs(percentile_idx);
+absolute_peak = max(abs(x_adaptive));
+
+fprintf('  99.5th percentile peak: %.4f, Absolute peak: %.4f\n', signal_peak_99p5, absolute_peak);
+
+% Calculate gain to bring 99.5th percentile to 0.98
+target_peak = 0.98;
+calculated_gain = target_peak / signal_peak_99p5;
+
+% Limit gain to prevent over-amplification
+max_gain = 15.0;
+calculated_gain = min(calculated_gain, max_gain);
+
+fprintf('  Calculated gain: %.2fx\n', calculated_gain);
+
+% Apply smart amplification
+x_adaptive_amplified = zeros(size(x_adaptive));
+
+for i = 1:length(x_adaptive)
+    sample_abs = abs(x_adaptive(i));
+    
+    if sample_abs < noise_threshold
+        % Below threshold: apply full gain
+        gain = calculated_gain;
+    else
+        % Above threshold: blend between calculated gain and minimal gain
+        excess_ratio = (sample_abs - noise_threshold) / (signal_peak_99p5 - noise_threshold + eps);
+        excess_ratio = min(excess_ratio, 1.0);
+        
+        % Interpolate between calculated_gain and 1.0
+        gain = calculated_gain * (1 - 0.7 * excess_ratio) + 1.0 * (0.7 * excess_ratio);
+    end
+    
+    x_adaptive_amplified(i) = x_adaptive(i) * gain;
+end
+
+% Clip any remaining outlier spikes (above 0.99)
+x_adaptive_amplified(x_adaptive_amplified > 0.99) = 0.99;
+x_adaptive_amplified(x_adaptive_amplified < -0.99) = -0.99;
+
+x_adaptive = x_adaptive_amplified;
+
+fprintf('  Final peak: %.4f, Final RMS: %.4f (%.1f%% of original)\n', ...
+        max(abs(x_adaptive)), rms(x_adaptive), (rms(x_adaptive)/original_rms)*100);
+
 audiowrite('stage_2c_adaptive_gating.wav', x_adaptive, fs);
 fprintf('✓ Adaptive spectral gating complete\n');
 
-%% STAGE 2D: Median Filter (Removes Impulse Noise)
-fprintf('\n=== Stage 2D: Median Filtering ===\n');
+%% STAGE 3: Adaptive Amplitude Restoration
+fprintf('\n=== Stage 3: Adaptive Amplitude Restoration ===\n');
 
-% Apply median filter to remove impulse noise/clicks
-med_window = round(0.003 * fs); % 3ms window
-if mod(med_window, 2) == 0
-    med_window = med_window + 1; % Must be odd
-end
+denoised_versions = {x_wiener, x_ss, x_adaptive};
+version_names = {'Wiener', 'SpectralSub', 'Adaptive'};
 
-x_med = medfilt1(x_bp, med_window);
-x_med = x_med / max(abs(x_med)) * 0.95;
-audiowrite('stage_2d_median_filtered.wav', x_med, fs);
-fprintf('✓ Median filtering complete\n');
+amplified_versions = cell(3, 1);
 
-%% STAGE 3: Voice Amplification (Applied to BEST denoised version)
-fprintf('\n=== Stage 3: Voice Amplification (2.5x) ===\n');
-
-% Apply to all denoised versions
-denoised_versions = {x_wiener, x_ss, x_adaptive, x_med};
-version_names = {'Wiener', 'SpectralSub', 'Adaptive', 'Median'};
-
-amplified_versions = cell(4, 1);
-
-for v = 1:4
+for v = 1:3
     signal = denoised_versions{v};
     
+    fprintf('\nProcessing %s:\n', version_names{v});
+    
+    % Voice Activity Detection
     frame_size = round(0.025 * fs);
     hop_size = round(0.010 * fs);
-    
     num_frames = floor((length(signal) - frame_size) / hop_size) + 1;
     voice_mask = zeros(length(signal), 1);
     
-    % Voice Activity Detection
     for i = 1:num_frames
         start_idx = (i-1) * hop_size + 1;
         end_idx = start_idx + frame_size - 1;
@@ -316,22 +372,80 @@ for v = 1:4
     smooth_window = round(0.05 * fs);
     voice_mask = conv(voice_mask, ones(smooth_window,1)/smooth_window, 'same');
     
-    % Amplify voice regions by 2.5x
-    voice_gain = 2.5;
-    amplified = signal .* (1 + voice_mask * (voice_gain - 1));
-    amplified = amplified / max(abs(amplified)) * 0.95;
+    % Calculate RMS of voice regions in original vs denoised
+    voice_indices = voice_mask > 0.5;
+    
+    if sum(voice_indices) > 0
+        % Get corresponding regions from original signal
+        x_aligned = x;
+        if length(x_aligned) > length(signal)
+            x_aligned = x_aligned(1:length(signal));
+        elseif length(x_aligned) < length(signal)
+            signal = signal(1:length(x_aligned));
+            voice_indices = voice_indices(1:length(x_aligned));
+        end
+        
+        original_voice_rms = rms(x_aligned(voice_indices));
+        denoised_voice_rms = rms(signal(voice_indices));
+        
+        % Calculate required gain to restore original amplitude
+        if denoised_voice_rms > 0
+            restoration_gain = original_voice_rms / denoised_voice_rms;
+        else
+            restoration_gain = 1.0;
+        end
+        
+        % Limit gain to reasonable range (prevent over-amplification)
+        restoration_gain = min(restoration_gain, 8.0);
+        restoration_gain = max(restoration_gain, 1.0);
+        
+        fprintf('  Voice RMS - Original: %.4f, Denoised: %.4f\n', ...
+                original_voice_rms, denoised_voice_rms);
+        fprintf('  Calculated restoration gain: %.2fx\n', restoration_gain);
+    else
+        % Fallback if no voice detected
+        restoration_gain = 2.5;
+        fprintf('  No voice detected, using default gain: %.2fx\n', restoration_gain);
+    end
+    
+    % Apply adaptive amplification only to voice regions
+    amplified = signal .* (1 + voice_mask * (restoration_gain - 1));
+    
+    % Percentile-based normalization to handle spikes
+    sorted_abs = sort(abs(amplified));
+    percentile_idx = round(0.995 * length(sorted_abs));
+    peak_99p5 = sorted_abs(percentile_idx);
+    absolute_peak = max(abs(amplified));
+    
+    fprintf('  99.5th percentile: %.4f, Absolute peak: %.4f\n', peak_99p5, absolute_peak);
+    
+    % Normalize to 99.5th percentile
+    amplified = amplified / peak_99p5 * 0.99;
+    
+    % Clip any remaining outliers
+    amplified(amplified > 0.99) = 0.99;
+    amplified(amplified < -0.99) = -0.99;
+    
+    final_rms = rms(amplified);
+    if sum(voice_indices) > 0
+        final_voice_rms = rms(amplified(voice_indices));
+        fprintf('  Final voice RMS: %.4f (%.1f%% of original)\n', ...
+                final_voice_rms, (final_voice_rms/original_voice_rms)*100);
+    end
+    fprintf('  Final total RMS: %.4f (%.1f%% of original)\n', ...
+            final_rms, (final_rms/original_rms)*100);
+    fprintf('  Final peak amplitude: %.4f\n', max(abs(amplified)));
     
     amplified_versions{v} = amplified;
     
     filename = sprintf('stage_3_%s_amplified.wav', lower(version_names{v}));
     audiowrite(filename, amplified, fs);
-    fprintf('✓ %s amplified (2.5x)\n', version_names{v});
+    fprintf('✓ %s restored (%.2fx adaptive gain)\n', version_names{v}, restoration_gain);
 end
 
-%% STAGE 4: Combined Best Approach (Wiener + Spectral Subtraction)
+%% STAGE 4: Combined Best Approach with Adaptive Restoration
 fprintf('\n=== Stage 4: Combined Multi-Stage Enhancement ===\n');
 
-% Apply Wiener filter first, then spectral subtraction for extra cleaning
 x_combined = x_wiener;
 
 % Apply additional spectral subtraction
@@ -361,7 +475,7 @@ num_frames = floor((length(x_combined) - frame_size) / hop_size) + 1;
 x_final = zeros(length(x_combined), 1);
 window_sum = zeros(length(x_combined), 1);
 
-alpha = 1.5;  % Gentler over-subtraction on already cleaned signal
+alpha = 1.5;
 beta = 0.001;
 
 for i = 1:num_frames
@@ -390,7 +504,7 @@ end
 
 x_final = x_final ./ max(window_sum, eps);
 
-% Voice amplification
+% Adaptive voice amplification
 frame_size = round(0.025 * fs);
 hop_size = round(0.010 * fs);
 num_frames = floor((length(x_final) - frame_size) / hop_size) + 1;
@@ -414,204 +528,92 @@ end
 smooth_window = round(0.05 * fs);
 voice_mask = conv(voice_mask, ones(smooth_window,1)/smooth_window, 'same');
 
-x_final = x_final .* (1 + voice_mask * 1.5);
-x_final = x_final / max(abs(x_final)) * 0.95;
-
-audiowrite('stage_4_combined_best.wav', x_final, fs);
-fprintf('✓ Combined enhancement complete\n');
-
-%% Generate Clean Reference Signal
-fprintf('\n=== Generating Clean Reference Signal ===\n');
-
-% Synthesize a clean speech-like signal for comparison
-duration = min(5, length(x)/fs); % 5 seconds or length of input
-t_clean = 0:1/fs:duration-1/fs;
-
-% Create multi-formant speech-like signal
-% Formants for vowel /a/: F1=700Hz, F2=1200Hz, F3=2500Hz
-f0 = 150; % Fundamental frequency (male voice)
-
-% Generate harmonic series
-clean_signal = zeros(size(t_clean));
-for harmonic = 1:20
-    freq = harmonic * f0;
-    if freq < fs/2
-        % Amplitude rolloff for higher harmonics
-        amplitude = 1 / harmonic^1.2;
-        clean_signal = clean_signal + amplitude * sin(2*pi*freq*t_clean);
+% Calculate adaptive restoration gain
+voice_indices = voice_mask > 0.5;
+if sum(voice_indices) > 0
+    x_aligned = x;
+    if length(x_aligned) > length(x_final)
+        x_aligned = x_aligned(1:length(x_final));
+    elseif length(x_aligned) < length(x_final)
+        x_final_temp = x_final(1:length(x_aligned));
+        voice_indices = voice_indices(1:length(x_aligned));
+    else
+        x_final_temp = x_final;
     end
+    
+    original_voice_rms = rms(x_aligned(voice_indices));
+    denoised_voice_rms = rms(x_final(voice_indices));
+    
+    if denoised_voice_rms > 0
+        combined_gain = original_voice_rms / denoised_voice_rms;
+    else
+        combined_gain = 1.0;
+    end
+    
+    combined_gain = min(combined_gain, 8.0);
+    combined_gain = max(combined_gain, 1.0);
+    
+    fprintf('Combined approach restoration gain: %.2fx\n', combined_gain);
+else
+    combined_gain = 2.5;
 end
 
-% Add formant structure (resonances)
-% Formant 1 at 700 Hz
-[b1, a1] = butter(2, [650 750]/(fs/2), 'bandpass');
-formant1 = filter(b1, a1, clean_signal);
+x_final = x_final .* (1 + voice_mask * (combined_gain - 1));
 
-% Formant 2 at 1200 Hz
-[b2, a2] = butter(2, [1100 1300]/(fs/2), 'bandpass');
-formant2 = filter(b2, a2, clean_signal) * 0.6;
+% Percentile-based normalization to handle spikes
+sorted_abs = sort(abs(x_final));
+percentile_idx = round(0.995 * length(sorted_abs));
+peak_99p5 = sorted_abs(percentile_idx);
+absolute_peak = max(abs(x_final));
 
-% Formant 3 at 2500 Hz
-[b3, a3] = butter(2, [2300 2700]/(fs/2), 'bandpass');
-formant3 = filter(b3, a3, clean_signal) * 0.3;
+fprintf('Combined - 99.5th percentile: %.4f, Absolute peak: %.4f\n', peak_99p5, absolute_peak);
 
-% Combine formants
-clean_signal = formant1 + formant2 + formant3;
+% Normalize to 99.5th percentile
+x_final = x_final / peak_99p5 * 0.99;
 
-% Add natural amplitude modulation (like speech prosody)
-mod_freq = 4; % 4 Hz modulation (syllable rate)
-amplitude_envelope = 0.5 + 0.5 * sin(2*pi*mod_freq*t_clean);
-clean_signal = clean_signal .* amplitude_envelope;
+% Clip any remaining outliers
+x_final(x_final > 0.99) = 0.99;
+x_final(x_final < -0.99) = -0.99;
 
-% Normalize
-clean_signal = clean_signal / max(abs(clean_signal)) * 0.7;
-clean_signal = clean_signal(:);
+fprintf('Final combined RMS: %.4f (%.1f%% of original)\n', rms(x_final), (rms(x_final)/original_rms)*100);
+fprintf('Final combined peak: %.4f\n', max(abs(x_final)));
 
-% Save clean reference
-audiowrite('reference_clean_speech.wav', clean_signal, fs);
-fprintf('✓ Clean reference signal generated\n');
+audiowrite('stage_4_combined.wav', x_final, fs);
+fprintf('✓ Combined enhancement complete\n');
 
-%% Visualization with Clean Reference
+%% Visualization
 fprintf('\n=== Generating Visualizations ===\n');
 
-% Main comparison figure
 figure('Position', [50 50 1600 1200]);
 
-signals = {x, x_bp, x_wiener, x_ss, x_adaptive, x_med, amplified_versions{3}, x_final};
+signals = {x, x_bp, x_wiener, x_ss, x_adaptive, amplified_versions{3}, x_final};
 titles = {'Original', 'Bandpass', 'Wiener Filtered', 'Spectral Sub', ...
-          'Adaptive Gating', 'Median Filtered', 'Adaptive + Amp (2.5x)', 'Combined Best'};
+          'Adaptive Gating', 'Adaptive + Restored', 'Combined Best'};
 
-for i = 1:8
+for i = 1:7
     sig = signals{i};
     t = (0:length(sig)-1) / fs;
     
     % Waveform
-    subplot(8, 2, 2*i-1);
+    subplot(7, 2, 2*i-1);
     plot(t, sig, 'LineWidth', 0.5);
     title(titles{i}, 'FontWeight', 'bold');
     xlabel('Time (s)'); ylabel('Amplitude');
     grid on; axis tight; ylim([-1 1]);
     
+    % Add RMS indicator
+    sig_rms = rms(sig);
+    text(0.02, 0.9, sprintf('RMS: %.4f', sig_rms), ...
+         'Units', 'normalized', 'FontSize', 8, 'BackgroundColor', 'white');
+    
     % Spectrogram
-    subplot(8, 2, 2*i);
+    subplot(7, 2, 2*i);
     spectrogram(sig, hann(512), 256, 1024, fs, 'yaxis');
     title([titles{i} ' - Spectrogram']);
     colormap jet; caxis([-80 0]);
 end
 
-sgtitle('Multi-Algorithm Speech Enhancement with AI-Inspired Adaptive Gating', 'FontSize', 14, 'FontWeight', 'bold');
-
-%% Clean Reference Comparison Figure
-figure('Position', [100 100 1600 800]);
-sgtitle('Comparison with Clean Reference Signal', 'FontSize', 14, 'FontWeight', 'bold');
-
-% Clean Reference
-subplot(3, 3, 1);
-plot(t_clean, clean_signal, 'g', 'LineWidth', 0.5);
-title('Clean Reference - Waveform', 'FontWeight', 'bold', 'Color', 'g');
-xlabel('Time (s)'); ylabel('Amplitude');
-grid on; axis tight; ylim([-1 1]);
-
-subplot(3, 3, 2);
-spectrogram(clean_signal, hann(512), 256, 1024, fs, 'yaxis');
-title('Clean Reference - Spectrogram', 'FontWeight', 'bold');
-colormap jet; caxis([-80 0]);
-ylim([0 4]);
-
-subplot(3, 3, 3);
-[pxx_clean, f_clean] = pwelch(clean_signal, hann(2048), 1024, 4096, fs);
-plot(f_clean, 10*log10(pxx_clean), 'g', 'LineWidth', 1.5);
-title('Clean Reference - PSD', 'FontWeight', 'bold');
-xlabel('Frequency (Hz)'); ylabel('Power (dB/Hz)');
-grid on; xlim([0 4000]);
-
-% Original (Noisy)
-subplot(3, 3, 4);
-t_orig = (0:length(x)-1) / fs;
-plot(t_orig, x, 'r', 'LineWidth', 0.5);
-title('Original (Noisy) - Waveform', 'FontWeight', 'bold', 'Color', 'r');
-xlabel('Time (s)'); ylabel('Amplitude');
-grid on; axis tight; ylim([-1 1]);
-
-subplot(3, 3, 5);
-spectrogram(x, hann(512), 256, 1024, fs, 'yaxis');
-title('Original (Noisy) - Spectrogram', 'FontWeight', 'bold');
-colormap jet; caxis([-80 0]);
-ylim([0 4]);
-
-subplot(3, 3, 6);
-[pxx_orig, f_orig] = pwelch(x, hann(2048), 1024, 4096, fs);
-plot(f_orig, 10*log10(pxx_orig), 'r', 'LineWidth', 1.5);
-title('Original (Noisy) - PSD', 'FontWeight', 'bold');
-xlabel('Frequency (Hz)'); ylabel('Power (dB/Hz)');
-grid on; xlim([0 4000]);
-
-% Best Enhanced (Combined)
-subplot(3, 3, 7);
-t_final = (0:length(x_final)-1) / fs;
-plot(t_final, x_final, 'b', 'LineWidth', 0.5);
-title('Enhanced (Combined Best) - Waveform', 'FontWeight', 'bold', 'Color', 'b');
-xlabel('Time (s)'); ylabel('Amplitude');
-grid on; axis tight; ylim([-1 1]);
-
-subplot(3, 3, 8);
-spectrogram(x_final, hann(512), 256, 1024, fs, 'yaxis');
-title('Enhanced (Combined Best) - Spectrogram', 'FontWeight', 'bold');
-colormap jet; caxis([-80 0]);
-ylim([0 4]);
-
-subplot(3, 3, 9);
-[pxx_final, f_final] = pwelch(x_final, hann(2048), 1024, 4096, fs);
-plot(f_final, 10*log10(pxx_final), 'b', 'LineWidth', 1.5);
-title('Enhanced (Combined Best) - PSD', 'FontWeight', 'bold');
-xlabel('Frequency (Hz)'); ylabel('Power (dB/Hz)');
-grid on; xlim([0 4000]);
-
-%% Spectral Comparison Figure
-figure('Position', [150 150 1400 600]);
-sgtitle('Power Spectral Density Comparison', 'FontSize', 14, 'FontWeight', 'bold');
-
-% Calculate PSDs for all versions
-[pxx_bp, f_bp] = pwelch(x_bp, hann(2048), 1024, 4096, fs);
-[pxx_wiener, f_wiener] = pwelch(x_wiener, hann(2048), 1024, 4096, fs);
-[pxx_ss, f_ss] = pwelch(x_ss, hann(2048), 1024, 4096, fs);
-[pxx_adaptive, f_adaptive] = pwelch(x_adaptive, hann(2048), 1024, 4096, fs);
-
-subplot(2, 2, 1);
-hold on;
-plot(f_clean, 10*log10(pxx_clean), 'g', 'LineWidth', 2, 'DisplayName', 'Clean Reference');
-plot(f_orig, 10*log10(pxx_orig), 'r', 'LineWidth', 1.5, 'DisplayName', 'Original (Noisy)');
-hold off;
-title('Clean vs Noisy', 'FontWeight', 'bold');
-xlabel('Frequency (Hz)'); ylabel('Power (dB/Hz)');
-legend('Location', 'northeast'); grid on; xlim([0 4000]);
-
-subplot(2, 2, 2);
-hold on;
-plot(f_clean, 10*log10(pxx_clean), 'g', 'LineWidth', 2, 'DisplayName', 'Clean Reference');
-plot(f_wiener, 10*log10(pxx_wiener), 'b', 'LineWidth', 1.5, 'DisplayName', 'Wiener Filtered');
-hold off;
-title('Wiener Filter vs Clean', 'FontWeight', 'bold');
-xlabel('Frequency (Hz)'); ylabel('Power (dB/Hz)');
-legend('Location', 'northeast'); grid on; xlim([0 4000]);
-
-subplot(2, 2, 3);
-hold on;
-plot(f_clean, 10*log10(pxx_clean), 'g', 'LineWidth', 2, 'DisplayName', 'Clean Reference');
-plot(f_adaptive, 10*log10(pxx_adaptive), 'm', 'LineWidth', 1.5, 'DisplayName', 'Adaptive Gating');
-hold off;
-title('Adaptive Gating vs Clean', 'FontWeight', 'bold');
-xlabel('Frequency (Hz)'); ylabel('Power (dB/Hz)');
-legend('Location', 'northeast'); grid on; xlim([0 4000]);
-
-subplot(2, 2, 4);
-hold on;
-plot(f_clean, 10*log10(pxx_clean), 'g', 'LineWidth', 2, 'DisplayName', 'Clean Reference');
-plot(f_final, 10*log10(pxx_final), 'k', 'LineWidth', 1.5, 'DisplayName', 'Combined Best');
-hold off;
-title('Combined Best vs Clean', 'FontWeight', 'bold');
-xlabel('Frequency (Hz)'); ylabel('Power (dB/Hz)');
-legend('Location', 'northeast'); grid on; xlim([0 4000]);
+sgtitle('Adaptive Amplitude Restoration Speech Enhancement', 'FontSize', 14, 'FontWeight', 'bold');
 
 %% Quality Metrics
 fprintf('\n=== Quality Metrics ===\n');
@@ -621,7 +623,6 @@ noise_bp = std(x_bp(1:min(round(0.5*fs), length(x_bp))));
 noise_wiener = std(x_wiener(1:min(round(0.5*fs), length(x_wiener))));
 noise_ss = std(x_ss(1:min(round(0.5*fs), length(x_ss))));
 noise_adaptive = std(x_adaptive(1:min(round(0.5*fs), length(x_adaptive))));
-noise_med = std(x_med(1:min(round(0.5*fs), length(x_med))));
 noise_final = std(x_final(1:min(round(0.5*fs), length(x_final))));
 
 fprintf('Noise Floor (std dev):\n');
@@ -630,8 +631,15 @@ fprintf('  Bandpass:              %.6f (%.1f%% reduction)\n', noise_bp, (1-noise
 fprintf('  Wiener Filtered:       %.6f (%.1f%% reduction)\n', noise_wiener, (1-noise_wiener/noise_orig)*100);
 fprintf('  Spectral Subtraction:  %.6f (%.1f%% reduction)\n', noise_ss, (1-noise_ss/noise_orig)*100);
 fprintf('  Adaptive Gating:       %.6f (%.1f%% reduction)\n', noise_adaptive, (1-noise_adaptive/noise_orig)*100);
-fprintf('  Median Filtered:       %.6f (%.1f%% reduction)\n', noise_med, (1-noise_med/noise_orig)*100);
 fprintf('  Combined Best:         %.6f (%.1f%% reduction)\n', noise_final, (1-noise_final/noise_orig)*100);
+
+fprintf('\n=== Amplitude Metrics ===\n');
+fprintf('RMS Levels:\n');
+fprintf('  Original:              %.6f\n', original_rms);
+fprintf('  Wiener (restored):     %.6f (%.1f%% of original)\n', rms(amplified_versions{1}), rms(amplified_versions{1})/original_rms*100);
+fprintf('  SpectralSub (restored):%.6f (%.1f%% of original)\n', rms(amplified_versions{2}), rms(amplified_versions{2})/original_rms*100);
+fprintf('  Adaptive (restored):   %.6f (%.1f%% of original)\n', rms(amplified_versions{3}), rms(amplified_versions{3})/original_rms*100);
+fprintf('  Combined Best:         %.6f (%.1f%% of original)\n', rms(x_final), rms(x_final)/original_rms*100);
 
 fprintf('\n=== Files Generated ===\n');
 fprintf('Stage 0: stage_0_original.wav\n');
@@ -639,14 +647,11 @@ fprintf('Stage 1: stage_1_bandpass.wav\n');
 fprintf('Stage 2: Multiple denoising algorithms\n');
 fprintf('  - stage_2a_wiener_filtered.wav\n');
 fprintf('  - stage_2b_spectral_subtraction.wav\n');
-fprintf('  - stage_2c_adaptive_gating.wav (AI-inspired)\n');
-fprintf('  - stage_2d_median_filtered.wav\n');
-fprintf('Stage 3: Voice amplified versions (2.5x)\n');
+fprintf('  - stage_2c_adaptive_gating.wav\n');
+fprintf('Stage 3: Adaptively restored versions\n');
 fprintf('  - stage_3_wiener_amplified.wav\n');
 fprintf('  - stage_3_spectralsub_amplified.wav\n');
 fprintf('  - stage_3_adaptive_amplified.wav\n');
-fprintf('  - stage_3_median_amplified.wav\n');
-fprintf('Stage 4: stage_4_combined_best.wav\n');
+fprintf('Stage 4: stage_4_combined.wav\n');
 
-fprintf('\n✅ Processing complete! Listen to each version to find best buzz removal.\n');
-fprintf('🎯 Recommended: Try stage_2c (Adaptive) or stage_2a (Wiener) or stage_4 (Combined)\n');
+fprintf('\n✓ Processing complete! Adaptive restoration maintains original amplitude.\n');
