@@ -19,6 +19,8 @@ import os
 import json
 import traceback
 import subprocess
+import tempfile
+import time
 
 
 def is_ffmpeg_available(exec_path=None):
@@ -50,7 +52,8 @@ try:
                                   QHBoxLayout, QPushButton, QLabel, QLineEdit, 
                                   QListWidget, QTabWidget, QComboBox, QSlider,
                                   QCheckBox, QTextEdit, QFileDialog, QMessageBox,
-                                  QProgressBar, QSpinBox, QGroupBox, QListWidgetItem)
+                                  QProgressBar, QSpinBox, QGroupBox, QListWidgetItem,
+                                  QScrollArea, QSizePolicy, QFrame, QGridLayout)
     from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QUrl
     from PyQt6.QtGui import QFont, QColor
     from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -265,6 +268,7 @@ class LiveAudioProcessor(QThread):
         if not PYAUDIO_AVAILABLE:
             raise ImportError("PyAudio is required for live processing")
         self.device_index = device_index
+        self.output_device = None  # Will be set later
         self.sample_rate = sample_rate
         self.chunk = 1024
         self.is_running = False
@@ -278,8 +282,8 @@ class LiveAudioProcessor(QThread):
             self.bandpass_filter = BandpassFilter(lowcut, highcut, self.sample_rate)
     
     def set_volume(self, multiplier):
-        """Set volume amplification (1-10x)"""
-        self.volume_multiplier = max(1.0, min(10.0, multiplier))
+        """Set volume amplification (1-30x)"""
+        self.volume_multiplier = max(1.0, min(30.0, multiplier))
     
     def run(self):
         try:
@@ -299,6 +303,7 @@ class LiveAudioProcessor(QThread):
                 channels=1,
                 rate=self.sample_rate,
                 output=True,
+                output_device_index=self.output_device,
                 frames_per_buffer=self.chunk
             )
             
@@ -490,44 +495,161 @@ class TranscriptionThread(QThread):
             self.error_occurred.emit(f"Vosk error: {str(e)}")
     
     def transcribe_speech_recognition(self):
-        """Transcribe using Python Speech Recognition"""
+        """Transcribe using Python Speech Recognition - Simple and reliable"""
         try:
             recognizer = sr.Recognizer()
-            audio_file = self.converted_file if self.converted_file else self.audio_file
-            # Validate that audio_file is a readable WAV with suitable parameters
-            try:
-                # Try open with wave to detect common format issues
-                with wave.open(audio_file, 'rb') as wf:
-                    nch = wf.getnchannels()
-                    sampw = wf.getsampwidth()
-                    fr = wf.getframerate()
-            except Exception as e:
-                self.error_occurred.emit(f"SpeechRecognition: cannot open audio file: {e}\nEnsure ffmpeg or SciPy is installed to convert files to 16kHz mono WAV.")
+            # Adjust energy threshold for better speech detection (lower = more sensitive)
+            recognizer.energy_threshold = 300
+            recognizer.dynamic_energy_threshold = False
+            
+            self.progress_update.emit(33)
+            
+            # Priority: Try original file first, then converted file
+            files_to_try = [self.audio_file]
+            if self.converted_file and self.converted_file != self.audio_file and os.path.exists(self.converted_file):
+                files_to_try.append(self.converted_file)
+            
+            audio_data = None
+            used_file = None
+            
+            # Try each file in order
+            for audio_file in files_to_try:
+                try:
+                    print(f"[SR] Trying file: {audio_file}")
+                    with sr.AudioFile(audio_file) as source:
+                        # Record the ENTIRE audio file (duration=-1 or not specified means all)
+                        audio_data = recognizer.record(source, duration=None)
+                        used_file = audio_file
+                        print(f"[SR] Successfully loaded entire audio from: {audio_file}")
+                        break
+                except Exception as e:
+                    print(f"[SR] Failed to read {audio_file}: {e}")
+                    continue
+            
+            if audio_data is None:
+                self.error_occurred.emit("SpeechRecognition: Could not read audio file. Ensure it's a valid WAV file.")
                 return
-
-            # If not mono 16-bit, try to convert (scipy fallback already attempted in convert_audio_to_16khz)
-            if nch != 1 or sampw != 2 or fr not in [8000, 16000, 32000, 48000]:
-                # Still try to proceed since sr.AudioFile can handle some rates, but warn
-                print(f"SpeechRecognition: audio format is nch={nch}, sampw={sampw}, fr={fr}. Proceeding but results may vary.")
-
-            with sr.AudioFile(audio_file) as source:
-                audio = recognizer.record(source)
-
+            
+            print(f"[SR] Starting Google Speech Recognition...")
             self.progress_update.emit(66)
-
-            try:
-                transcription = recognizer.recognize_google(audio)
-                self.progress_update.emit(100)
-                self.transcription_ready.emit('sr', transcription)
-            except sr.UnknownValueError:
-                self.transcription_ready.emit('sr', "[Could not understand audio]")
-                self.progress_update.emit(100)
-            except sr.RequestError as e:
-                self.error_occurred.emit(f"Speech Recognition request error: {e}\nEnsure you have network connectivity for Google SR.")
-        
+            
+            # Simple transcription with retry logic
+            def split_audio_data(audio_data, chunk_duration=30):
+                """Split audio data into chunks"""
+                try:
+                    # Get audio data properties
+                    frame_rate = audio_data.sample_rate
+                    frame_count = len(audio_data.frame_data) // 2  # 16-bit audio = 2 bytes per sample
+                    samples_per_chunk = int(frame_rate * chunk_duration)
+                    
+                    chunks = []
+                    for i in range(0, frame_count, samples_per_chunk):
+                        chunk = sr.AudioData(
+                            audio_data.frame_data[i*2:(i+samples_per_chunk)*2],
+                            frame_rate,
+                            audio_data.sample_width
+                        )
+                        chunks.append(chunk)
+                    return chunks
+                except Exception as e:
+                    print(f"[SR] Error splitting audio: {e}")
+                    return [audio_data]  # Return original as single chunk if splitting fails
+            
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                # Update progress based on attempt (33% per attempt)
+                self.progress_update.emit(66 + (attempt * 11))  # Start at 66%, increment by 11% per attempt
+                
+                try:
+                    print(f"[SR] Recognition attempt {attempt + 1}/{max_attempts}")
+                    # Try to get all possible transcriptions
+                    result = recognizer.recognize_google(audio_data, show_all=True)
+                    
+                    if result and isinstance(result, dict) and 'alternative' in result:
+                        # Get the best transcription (highest confidence)
+                        text = result['alternative'][0]['transcript']
+                        print(f"[SR] Success! Transcription: {text[:100]}...")
+                        self.progress_update.emit(100)
+                        self.transcription_ready.emit('sr', text)
+                        return
+                    elif result and isinstance(result, list) and result:
+                        # Handle case where we get a list of alternatives
+                        text = result[0]  # Take best match
+                        print(f"[SR] Partial success! Best match: {text[:100]}...")
+                        self.progress_update.emit(100)
+                        self.transcription_ready.emit('sr', text)
+                        return
+                    else:
+                        raise sr.UnknownValueError()
+                    
+                except sr.UnknownValueError:
+                    print(f"[SR] Could not understand audio clearly (attempt {attempt + 1}/{max_attempts})")
+                    if attempt == max_attempts - 1:
+                        # On final attempt, try chunking the audio
+                        try:
+                            print("[SR] Attempting chunked transcription...")
+                            chunks = split_audio_data(audio_data)
+                            transcriptions = []
+                            
+                            for i, chunk in enumerate(chunks):
+                                try:
+                                    chunk_text = recognizer.recognize_google(chunk, show_all=False)
+                                    if chunk_text:
+                                        transcriptions.append(chunk_text)
+                                        print(f"[SR] Chunk {i+1}/{len(chunks)} transcribed successfully")
+                                    else:
+                                        print(f"[SR] Chunk {i+1}/{len(chunks)} was unclear")
+                                except sr.UnknownValueError:
+                                    print(f"[SR] Chunk {i+1}/{len(chunks)} was unclear")
+                                except sr.RequestError as e:
+                                    print(f"[SR] Error transcribing chunk {i+1}: {e}")
+                                    time.sleep(2)  # Brief pause between chunks on error
+                            
+                            if transcriptions:
+                                full_text = " ".join(transcriptions)
+                                print(f"[SR] Assembled chunked transcription: {full_text[:100]}...")
+                                self.progress_update.emit(100)
+                                self.transcription_ready.emit('sr', f"[Chunked transcription]: {full_text}")
+                                return
+                            else:
+                                raise sr.UnknownValueError()
+                                
+                        except Exception as e:
+                            print(f"[SR] Chunked transcription failed: {e}")
+                            self.progress_update.emit(100)
+                            self.transcription_ready.emit('sr', "[Could not understand audio clearly after multiple attempts]")
+                            return
+                        except:
+                            self.progress_update.emit(100)
+                            self.transcription_ready.emit('sr', "[Could not understand audio clearly after multiple attempts]")
+                            return
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    
+                except sr.RequestError as e:
+                    print(f"[SR] Request error (attempt {attempt + 1}/{max_attempts}): {e}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        error_msg = (
+                            f"Speech Recognition network error: {e}\n\n"
+                            "Possible causes:\n"
+                            "• No internet connection\n"
+                            "• Google API rate limit\n"
+                            "• Firewall blocking request"
+                        )
+                        self.error_occurred.emit(error_msg)
+                        return
+                        
+                except Exception as ex:
+                    print(f"[SR] Unexpected error: {ex}")
+                    self.error_occurred.emit(f"Speech Recognition error: {ex}")
+                    return
+            
         except Exception as e:
-            self.error_occurred.emit(f"Speech Recognition error: {str(e)}")
-    
+            error_msg = f"Speech Recognition error: {str(e)}"
+            print(f"[SR] {error_msg}")
+            self.error_occurred.emit(error_msg)
+
     def transcribe_whisper(self):
         """Transcribe using OpenAI Whisper"""
         try:
@@ -621,6 +743,18 @@ if MATPLOTLIB_AVAILABLE:
             self.axes = fig.add_subplot(111)
             self.axes.set_facecolor('#0f0f1e')
             super().__init__(fig)
+            
+            # Enable responsive resizing
+            fig.set_tight_layout(True)
+            self.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding
+            )
+            self.updateGeometry()
+        
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self.figure.tight_layout()  # Adjust layout on resize
 
 
 class LaserMicrophoneApp(QMainWindow):
@@ -632,14 +766,29 @@ class LaserMicrophoneApp(QMainWindow):
         self.setGeometry(100, 100, 1400, 900)
         self.setStyleSheet(self.get_stylesheet())
         
-        self.audio_devices = []
-        self.selected_device = 0
+        self.input_devices = []
+        self.output_devices = []
+        self.selected_input_device = 0
+        self.selected_output_device = 0
         
         if PYAUDIO_AVAILABLE:
             try:
                 self.p = pyaudio.PyAudio()
-                self.audio_devices = self.get_audio_devices()
-                print(f"✓ Found {len(self.audio_devices)} audio devices")
+                self.input_devices, self.output_devices = self.get_audio_devices()
+                print(f"✓ Found {len(self.input_devices)} input devices and {len(self.output_devices)} output devices")
+                
+                # Auto-select first USB device for input if available
+                usb_input = next((dev for dev in self.input_devices if dev['is_usb']), None)
+                if usb_input:
+                    self.selected_input_device = usb_input['index']
+                    print(f"✓ Auto-selected USB input device: {usb_input['name']}")
+                
+                # Auto-select first non-USB device for output if available
+                default_output = next((dev for dev in self.output_devices if not dev['is_usb']), None)
+                if default_output:
+                    self.selected_output_device = default_output['index']
+                    print(f"✓ Auto-selected default output device: {default_output['name']}")
+                
             except Exception as e:
                 print(f"WARNING: PyAudio initialization failed: {e}")
                 self.p = None
@@ -684,25 +833,42 @@ class LaserMicrophoneApp(QMainWindow):
         print("✓ Application initialized successfully")
     
     def get_audio_devices(self):
-        """Get list of available audio input devices"""
-        devices = []
+        """Get list of available audio input and output devices"""
+        input_devices = []
+        output_devices = []
         if not self.p:
-            return devices
+            return input_devices, output_devices
         
         try:
             for i in range(self.p.get_device_count()):
                 info = self.p.get_device_info_by_index(i)
+                device_info = {
+                    'index': i,
+                    'name': info['name'],
+                    'channels': info['maxInputChannels'],
+                    'sample_rate': int(info['defaultSampleRate']),
+                    'is_usb': 'usb' in info['name'].lower()
+                }
+                
                 if info['maxInputChannels'] > 0:
-                    devices.append({
-                        'index': i,
-                        'name': info['name'],
-                        'channels': info['maxInputChannels'],
-                        'sample_rate': int(info['defaultSampleRate'])
-                    })
+                    input_devices.append(device_info)
+                if info['maxOutputChannels'] > 0:
+                    output_devices.append(device_info)
+                    
+                # Print device info for debugging
+                print(f"Found device {i}: {info['name']}")
+                print(f"  Input channels: {info['maxInputChannels']}")
+                print(f"  Output channels: {info['maxOutputChannels']}")
+                print(f"  Sample rate: {info['defaultSampleRate']}")
+                
         except Exception as e:
             print(f"Error getting audio devices: {e}")
         
-        return devices
+        # Sort devices to prefer USB devices for input and default devices for output
+        input_devices.sort(key=lambda x: (not x['is_usb'], x['name']))
+        output_devices.sort(key=lambda x: (x['is_usb'], x['name']))  # Non-USB first for output
+        
+        return input_devices, output_devices
     
     def load_recordings(self):
         """Load recordings from database file"""
@@ -726,12 +892,27 @@ class LaserMicrophoneApp(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
         
+        # Create and configure left panel
         left_panel = self.create_left_panel()
-        main_layout.addWidget(left_panel, 1)
+        left_panel.setMinimumWidth(300)
+        left_panel.setMaximumWidth(400)
+        main_layout.addWidget(left_panel)
+        
+        # Create and configure right panel with scroll area
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
         
         right_panel = self.create_right_panel()
-        main_layout.addWidget(right_panel, 3)
+        right_scroll.setWidget(right_panel)
+        
+        main_layout.addWidget(right_scroll, 1)  # Give right panel more stretch
+        
+        # Set minimum window size
+        self.setMinimumSize(1000, 700)
     
     def create_left_panel(self):
         """Create left control panel"""
@@ -743,19 +924,52 @@ class LaserMicrophoneApp(QMainWindow):
         header.setStyleSheet("color: #a855f7; padding: 10px;")
         layout.addWidget(header)
         
-        device_group = QGroupBox("Audio Input Device")
+        device_group = QGroupBox("Audio Devices")
         device_layout = QVBoxLayout()
-        self.device_combo = QComboBox()
         
-        if self.audio_devices:
-            for device in self.audio_devices:
-                self.device_combo.addItem(f"{device['name']} ({device['sample_rate']} Hz)", device['index'])
-            self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        # Input device selection
+        input_label = QLabel("Recording Input Device:")
+        device_layout.addWidget(input_label)
+        self.input_device_combo = QComboBox()
+        
+        # Output device selection
+        output_label = QLabel("Playback Output Device:")
+        device_layout.addWidget(output_label)
+        self.output_device_combo = QComboBox()
+        
+        self.input_devices, self.output_devices = self.get_audio_devices()
+        
+        if self.input_devices:
+            for device in self.input_devices:
+                self.input_device_combo.addItem(
+                    f"{'[USB] ' if device['is_usb'] else ''}{device['name']} ({device['sample_rate']} Hz)", 
+                    device['index']
+                )
+            # Auto-select first USB device if available
+            usb_index = next((i for i, d in enumerate(self.input_devices) if d['is_usb']), 0)
+            self.input_device_combo.setCurrentIndex(usb_index)
+            self.input_device_combo.currentIndexChanged.connect(self.on_input_device_changed)
         else:
-            self.device_combo.addItem("No audio devices found", -1)
-            self.device_combo.setEnabled(False)
+            self.input_device_combo.addItem("No input devices found", -1)
+            self.input_device_combo.setEnabled(False)
         
-        device_layout.addWidget(self.device_combo)
+        if self.output_devices:
+            for device in self.output_devices:
+                self.output_device_combo.addItem(
+                    f"{'[USB] ' if device['is_usb'] else ''}{device['name']} ({device['sample_rate']} Hz)", 
+                    device['index']
+                )
+            # Auto-select first non-USB device if available
+            default_index = next((i for i, d in enumerate(self.output_devices) if not d['is_usb']), 0)
+            self.output_device_combo.setCurrentIndex(default_index)
+            self.output_device_combo.currentIndexChanged.connect(self.on_output_device_changed)
+        else:
+            self.output_device_combo.addItem("No output devices found", -1)
+            self.output_device_combo.setEnabled(False)
+        
+        device_layout.addWidget(self.input_device_combo)
+        device_layout.addWidget(output_label)
+        device_layout.addWidget(self.output_device_combo)
         device_group.setLayout(device_layout)
         layout.addWidget(device_group)
         
@@ -807,13 +1021,17 @@ class LaserMicrophoneApp(QMainWindow):
         volume_layout.addWidget(volume_label)
         
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.setMinimum(10)
-        self.volume_slider.setMaximum(100)
-        self.volume_slider.setValue(10)
+        self.volume_slider.setMinimum(10)  # 1.0x minimum
+        self.volume_slider.setMaximum(300)  # 30.0x maximum
+        self.volume_slider.setValue(10)  # Default 1.0x
         self.volume_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.volume_slider.setTickInterval(10)
+        self.volume_slider.setTickInterval(50)  # Ticks every 5.0x
         self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        
+        volume_warning = QLabel("High amplification may cause distortion")
+        volume_warning.setStyleSheet("color: #ffa500; font-size: 10px;")
         volume_layout.addWidget(self.volume_slider)
+        volume_layout.addWidget(volume_warning)
         recording_layout.addLayout(volume_layout)
         
         self.volume_label = QLabel("Input Level: 0%")
@@ -881,9 +1099,14 @@ class LaserMicrophoneApp(QMainWindow):
         """Create right content panel"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
         
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(True)
         
+        # Create and add tabs
         recordings_tab = self.create_recordings_tab()
         self.tabs.addTab(recordings_tab, "📁 Recordings")
         
@@ -901,26 +1124,33 @@ class LaserMicrophoneApp(QMainWindow):
         """Create recordings list tab"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        
+        # Recordings list with scroll area
+        list_container = QWidget()
+        list_layout = QVBoxLayout(list_container)
+        list_layout.setContentsMargins(0, 0, 0, 0)
         
         self.recordings_list = QListWidget()
         self.recordings_list.itemClicked.connect(self.on_recording_selected)
+        self.recordings_list.setMinimumHeight(300)
         self.update_recordings_list()
-        layout.addWidget(self.recordings_list)
+        list_layout.addWidget(self.recordings_list)
         
-        playback_group = QGroupBox("Playback Controls")
-        playback_layout = QVBoxLayout()
+        playback_container = QWidget()
+        playback_layout = QVBoxLayout(playback_container)
+        playback_layout.setContentsMargins(5, 0, 5, 5)
+        playback_layout.setSpacing(2)
         
         time_layout = QHBoxLayout()
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.setSpacing(5)
+        
         self.current_time_label = QLabel("00:00")
         self.current_time_label.setStyleSheet("color: #a855f7; font-weight: bold;")
+        self.current_time_label.setMinimumWidth(50)
         time_layout.addWidget(self.current_time_label)
-        
-        time_layout.addStretch()
-        
-        self.total_time_label = QLabel("00:00")
-        self.total_time_label.setStyleSheet("color: #888;")
-        time_layout.addWidget(self.total_time_label)
-        playback_layout.addLayout(time_layout)
         
         self.playback_slider = QSlider(Qt.Orientation.Horizontal)
         self.playback_slider.setMinimum(0)
@@ -928,42 +1158,67 @@ class LaserMicrophoneApp(QMainWindow):
         self.playback_slider.setValue(0)
         self.playback_slider.sliderMoved.connect(self.on_playback_slider_moved)
         self.playback_slider.setEnabled(False)
-        playback_layout.addWidget(self.playback_slider)
+        time_layout.addWidget(self.playback_slider)
         
-        playback_group.setLayout(playback_layout)
-        layout.addWidget(playback_group)
+        self.total_time_label = QLabel("00:00")
+        self.total_time_label.setStyleSheet("color: #888;")
+        self.total_time_label.setMinimumWidth(50)
+        time_layout.addWidget(self.total_time_label)
         
-        btn_layout = QHBoxLayout()
+        playback_layout.addLayout(time_layout)
         
+        # Add horizontal line
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        line.setStyleSheet("background-color: #2a2a3e;")
+        playback_layout.addWidget(line)
+        
+        layout.addWidget(playback_container)
+        
+        # Control button grid
+        btn_grid = QGridLayout()
+        btn_grid.setSpacing(5)
+        
+        # Row 1
         upload_btn = QPushButton("📤 Upload")
         upload_btn.clicked.connect(self.upload_recording)
-        btn_layout.addWidget(upload_btn)
+        btn_grid.addWidget(upload_btn, 0, 0)
         
         play_btn = QPushButton("▶ Play")
         play_btn.clicked.connect(self.play_recording)
-        btn_layout.addWidget(play_btn)
+        btn_grid.addWidget(play_btn, 0, 1)
         
         pause_btn = QPushButton("⏸ Pause")
         pause_btn.clicked.connect(self.pause_playback)
-        btn_layout.addWidget(pause_btn)
+        btn_grid.addWidget(pause_btn, 0, 2)
         
+        # Row 2
         stop_btn = QPushButton("⏹ Stop")
         stop_btn.clicked.connect(self.stop_playback)
-        btn_layout.addWidget(stop_btn)
+        btn_grid.addWidget(stop_btn, 1, 0)
         
-        transcribe_btn = QPushButton("📝 Transcribe")
-        transcribe_btn.clicked.connect(self.transcribe_selected)
-        btn_layout.addWidget(transcribe_btn)
-        
-        export_btn = QPushButton("💾 Export")
+        export_btn = QPushButton("� Export")
         export_btn.clicked.connect(self.export_recording)
-        btn_layout.addWidget(export_btn)
+        btn_grid.addWidget(export_btn, 1, 1)
         
-        delete_btn = QPushButton("🗑 Delete")
+        delete_btn = QPushButton("� Delete")
         delete_btn.clicked.connect(self.delete_recording)
-        btn_layout.addWidget(delete_btn)
+        btn_grid.addWidget(delete_btn, 1, 2)
         
-        layout.addLayout(btn_layout)
+        # Transcribe button spans full width
+        transcribe_btn = QPushButton("� Transcribe")
+        transcribe_btn.clicked.connect(self.transcribe_selected)
+        transcribe_btn.setMinimumHeight(40)
+        btn_grid.addWidget(transcribe_btn, 2, 0, 1, 3)  # span all columns
+        
+        # Set fixed size for all buttons
+        for i in range(btn_grid.count()):
+            widget = btn_grid.itemAt(i).widget()
+            if isinstance(widget, QPushButton):
+                widget.setMinimumHeight(35)
+        
+        layout.addLayout(btn_grid)
         
         return tab
     
@@ -971,25 +1226,38 @@ class LaserMicrophoneApp(QMainWindow):
         """Create visualization tab"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
         
         if MATPLOTLIB_AVAILABLE and SCIPY_AVAILABLE:
-            waveform_label = QLabel("Waveform")
-            waveform_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-            layout.addWidget(waveform_label)
+            waveform_group = QGroupBox("Waveform Visualization")
+            waveform_layout = QVBoxLayout()
             
             self.waveform_canvas = MplCanvas(self, width=8, height=3, dpi=100)
-            layout.addWidget(self.waveform_canvas)
+            self.waveform_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            waveform_layout.addWidget(self.waveform_canvas)
+            waveform_group.setLayout(waveform_layout)
+            layout.addWidget(waveform_group, 2)  # Higher stretch factor
             
-            spectrogram_label = QLabel("Spectrogram")
-            spectrogram_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-            layout.addWidget(spectrogram_label)
+            spectrogram_group = QGroupBox("Spectrogram Analysis")
+            spectrogram_layout = QVBoxLayout()
             
             self.spectrogram_canvas = MplCanvas(self, width=8, height=3, dpi=100)
-            layout.addWidget(self.spectrogram_canvas)
+            self.spectrogram_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            spectrogram_layout.addWidget(self.spectrogram_canvas)
+            spectrogram_group.setLayout(spectrogram_layout)
+            layout.addWidget(spectrogram_group, 2)  # Higher stretch factor
+            
+            control_group = QGroupBox("Visualization Controls")
+            control_layout = QVBoxLayout()
             
             load_btn = QPushButton("Load Selected Recording for Visualization")
+            load_btn.setMinimumHeight(40)
             load_btn.clicked.connect(self.visualize_selected)
-            layout.addWidget(load_btn)
+            control_layout.addWidget(load_btn)
+            
+            control_group.setLayout(control_layout)
+            layout.addWidget(control_group, 1)  # Lower stretch factor
         else:
             missing = []
             if not MATPLOTLIB_AVAILABLE:
@@ -1153,9 +1421,31 @@ class LaserMicrophoneApp(QMainWindow):
         
         return tab
     
-    def on_device_changed(self, index):
-        """Handle device selection change"""
-        self.selected_device = self.device_combo.itemData(index)
+    def on_input_device_changed(self, index):
+        """Handle input device selection change"""
+        if index >= 0 and self.input_devices:
+            device = self.input_devices[index]
+            self.selected_input_device = device['index']
+            print(f"Selected input device: {device['name']}")
+            
+            # Update recorders if running
+            if self.is_recording:
+                self.stop_recording()
+            if self.is_live_listening:
+                self.stop_live_listening()
+    
+    def on_output_device_changed(self, index):
+        """Handle output device selection change"""
+        if index >= 0 and self.output_devices:
+            device = self.output_devices[index]
+            self.selected_output_device = device['index']
+            print(f"Selected output device: {device['name']}")
+            
+            # Update live processor if running
+            if self.is_live_listening:
+                self.stop_live_listening()
+                time.sleep(0.1)  # Brief pause to ensure clean restart
+                self.start_live_listening()
     
     def on_filter_changed(self, state):
         """Handle filter checkbox change"""
@@ -1215,7 +1505,7 @@ class LaserMicrophoneApp(QMainWindow):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = os.path.join(self.recordings_dir, f"{name}_{timestamp}.wav")
             
-            self.recorder = AudioRecorder(self.selected_device)
+            self.recorder = AudioRecorder(self.selected_input_device)
             self.recorder.set_filter(self.filter_enabled, self.lowcut, self.highcut)
             self.recorder.filename = filename
             self.recorder.audio_data_ready.connect(self.on_audio_data)
@@ -1261,8 +1551,9 @@ class LaserMicrophoneApp(QMainWindow):
             return
         
         try:
-            self.live_processor = LiveAudioProcessor(self.selected_device)
+            self.live_processor = LiveAudioProcessor(self.selected_input_device)
             self.live_processor.set_filter(self.filter_enabled, self.lowcut, self.highcut)
+            self.live_processor.output_device = self.selected_output_device  # Set output device
             self.live_processor.set_volume(self.volume_multiplier)
             self.live_processor.audio_level.connect(self.update_volume_level)
             self.live_processor.start()
@@ -1332,10 +1623,40 @@ class LaserMicrophoneApp(QMainWindow):
     def update_recordings_list(self):
         """Update recordings list widget"""
         self.recordings_list.clear()
+        self.recordings_list.setStyleSheet("""
+            QListWidget {
+                background-color: #0f0f1e;
+                border: 2px solid #4a4a6a;
+                border-radius: 8px;
+                padding: 5px;
+            }
+            QListWidget::item {
+                background-color: #1a1a2e;
+                border: 1px solid #2a2a3e;
+                border-radius: 4px;
+                padding: 10px;
+                margin: 2px;
+                min-height: 30px;
+            }
+            QListWidget::item:selected {
+                background-color: #a855f7;
+                border: 1px solid #9333ea;
+            }
+            QListWidget::item:hover {
+                background-color: #2a2a3e;
+            }
+        """)
+        
         for rec in reversed(self.recordings):
-            item_text = f"{rec['name']} - {rec['timestamp'][:10]} ({rec['duration']}s)"
+            name_part = f"📄 {rec['name']}"
+            date_part = rec['timestamp'][:10]
+            duration_part = f"{rec['duration']}s"
+            
+            item_text = f"{name_part}\n"
+            item_text += f"📅 {date_part} • ⏱ {duration_part}"
+            
             if rec['filtered']:
-                item_text += f" [Filtered: {rec['lowcut']}-{rec['highcut']} Hz]"
+                item_text += f"\n🔊 Filtered: {rec['lowcut']}-{rec['highcut']} Hz"
             
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, rec)
