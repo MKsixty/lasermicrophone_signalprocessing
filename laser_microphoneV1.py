@@ -126,6 +126,37 @@ except ImportError:
     WHISPER_AVAILABLE = False
     print("WARNING: OpenAI Whisper not available. Install with: pip install openai-whisper")
 
+# Check for MATLAB availability (via subprocess - no package needed)
+def check_matlab_available():
+    """Check if MATLAB is available on the system"""
+    try:
+        # Try to find MATLAB executable
+        result = subprocess.run(['matlab', '-batch', 'exit'], 
+                              capture_output=True, 
+                              timeout=10,
+                              creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        # Try common Windows installation paths
+        if sys.platform == 'win32':
+            common_paths = [
+                r'C:\Program Files\MATLAB\R2025b\bin\matlab.exe',
+                r'C:\Program Files\MATLAB\R2025a\bin\matlab.exe',
+                r'C:\Program Files\MATLAB\R2024b\bin\matlab.exe',
+                r'C:\Program Files (x86)\MATLAB\R2025b\bin\matlab.exe',
+                r'C:\Program Files (x86)\MATLAB\R2025a\bin\matlab.exe',
+            ]
+            for path in common_paths:
+                if os.path.exists(path):
+                    return True
+        return False
+
+MATLAB_AVAILABLE = check_matlab_available()
+if MATLAB_AVAILABLE:
+    print(" MATLAB available (subprocess mode)")
+else:
+    print("WARNING: MATLAB not found. Ensure MATLAB is installed and accessible.")
+
 
 # Available Vosk models
 VOSK_MODELS = {
@@ -340,6 +371,120 @@ class LiveAudioProcessor(QThread):
     
     def stop(self):
         self.is_running = False
+
+
+class MatlabProcessingThread(QThread):
+    """Background thread for MATLAB audio processing via subprocess"""
+    processing_complete = pyqtSignal(str)  # processed filename
+    progress_update = pyqtSignal(str)  # status message
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, input_file, output_file, matlab_script='final_filter.m'):
+        super().__init__()
+        self.input_file = input_file
+        self.output_file = output_file
+        self.matlab_script = matlab_script
+        self.matlab_dir = os.path.dirname(os.path.abspath(matlab_script))
+    
+    def find_matlab_executable(self):
+        """Find MATLAB executable on the system"""
+        # Try matlab command first (if in PATH)
+        try:
+            result = subprocess.run(['matlab', '-batch', 'exit'], 
+                                  capture_output=True, 
+                                  timeout=5,
+                                  creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            if result.returncode == 0:
+                return 'matlab'
+        except:
+            pass
+        
+        # Try common Windows installation paths
+        if sys.platform == 'win32':
+            common_paths = [
+                r'C:\Program Files\MATLAB\R2025b\bin\matlab.exe',
+                r'C:\Program Files\MATLAB\R2025a\bin\matlab.exe',
+                r'C:\Program Files\MATLAB\R2024b\bin\matlab.exe',
+                r'C:\Program Files (x86)\MATLAB\R2025b\bin\matlab.exe',
+                r'C:\Program Files (x86)\MATLAB\R2025a\bin\matlab.exe',
+            ]
+            for path in common_paths:
+                if os.path.exists(path):
+                    return path
+        
+        return None
+    
+    def run(self):
+        """Process audio through MATLAB using subprocess"""
+        try:
+            if not MATLAB_AVAILABLE:
+                self.error_occurred.emit("MATLAB not found. Please ensure MATLAB is installed and accessible.")
+                return
+            
+            self.progress_update.emit("Preparing audio for MATLAB...")
+            
+            # Copy input file to app_audio.wav (expected by MATLAB script)
+            temp_input = os.path.join(self.matlab_dir, 'app_audio.wav')
+            shutil.copy(self.input_file, temp_input)
+            
+            self.progress_update.emit("Running MATLAB processing script...")
+            
+            # Find MATLAB executable
+            matlab_exe = self.find_matlab_executable()
+            if not matlab_exe:
+                self.error_occurred.emit("MATLAB executable not found. Please add MATLAB to your system PATH.")
+                return
+            
+            # Get script name without extension
+            script_name = os.path.splitext(os.path.basename(self.matlab_script))[0]
+            
+            # Run MATLAB script using -batch mode (no GUI, automatic exit)
+            # -batch is more reliable than -r for scripting
+            matlab_command = f"cd('{self.matlab_dir.replace(chr(92), chr(92)+chr(92))}'); {script_name}; exit;"
+            
+            # Execute MATLAB
+            process = subprocess.Popen(
+                [matlab_exe, '-batch', matlab_command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=self.matlab_dir,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            
+            # Wait for completion (with timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=120)  # 2 minute timeout
+                
+                if process.returncode != 0:
+                    error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
+                    self.error_occurred.emit(f"MATLAB script failed: {error_msg}")
+                    return
+                    
+            except subprocess.TimeoutExpired:
+                process.kill()
+                self.error_occurred.emit("MATLAB processing timed out (exceeded 2 minutes)")
+                return
+            
+            self.progress_update.emit("MATLAB processing complete. Copying output...")
+            
+            # Copy the output file (stage_4_combined.wav is the final output from MATLAB)
+            matlab_output = os.path.join(self.matlab_dir, 'stage_4_combined.wav')
+            if os.path.exists(matlab_output):
+                shutil.copy(matlab_output, self.output_file)
+                self.progress_update.emit("Processing complete!")
+                self.processing_complete.emit(self.output_file)
+            else:
+                self.error_occurred.emit(f"MATLAB output file not found: {matlab_output}\nScript may have failed to generate output.")
+            
+            # Clean up temporary file
+            if os.path.exists(temp_input):
+                try:
+                    os.remove(temp_input)
+                except:
+                    pass
+            
+        except Exception as e:
+            self.error_occurred.emit(f"MATLAB processing error: {str(e)}")
 
 
 class TranscriptionThread(QThread):
@@ -822,6 +967,11 @@ class LaserMicrophoneApp(QMainWindow):
         
         self.selected_vosk_model = 'vosk-model-small-en-us-0.15'
         
+        # MATLAB processing settings
+        self.matlab_enabled = MATLAB_AVAILABLE  # Enable by default if available
+        self.matlab_script_path = os.path.join(os.getcwd(), 'final_filter.m')
+        self.show_processed = True  # Show processed version by default
+        
         try:
             self.init_ui()
             print(" UI initialized successfully")
@@ -1025,6 +1175,19 @@ class LaserMicrophoneApp(QMainWindow):
         filter_layout.addWidget(self.filter_checkbox)
         recording_layout.addLayout(filter_layout)
         
+        # MATLAB processing checkbox
+        matlab_layout = QHBoxLayout()
+        self.matlab_checkbox = QCheckBox("MATLAB Post-Processing")
+        self.matlab_checkbox.setChecked(self.matlab_enabled)
+        self.matlab_checkbox.setEnabled(MATLAB_AVAILABLE)
+        self.matlab_checkbox.stateChanged.connect(self.on_matlab_changed)
+        if not MATLAB_AVAILABLE:
+            self.matlab_checkbox.setToolTip("MATLAB not found. Please ensure MATLAB is installed and accessible.")
+        else:
+            self.matlab_checkbox.setToolTip("Process audio through final_filter.m after recording")
+        matlab_layout.addWidget(self.matlab_checkbox)
+        recording_layout.addLayout(matlab_layout)
+        
         freq_layout = QVBoxLayout()
         
         lowcut_layout = QHBoxLayout()
@@ -1123,7 +1286,8 @@ class LaserMicrophoneApp(QMainWindow):
         status_text += f"Matplotlib:{'' if MATPLOTLIB_AVAILABLE else ''} "
         status_text += f"Vosk:{'' if VOSK_AVAILABLE else ''} "
         status_text += f"SR:{'' if SR_AVAILABLE else ''} "
-        status_text += f"Whisper:{'' if WHISPER_AVAILABLE else ''}"
+        status_text += f"Whisper:{'' if WHISPER_AVAILABLE else ''} "
+        status_text += f"MATLAB:{'' if MATLAB_AVAILABLE else ''}"
         
         # FFmpeg availability on PATH (initial check)
         ff_on_path = is_ffmpeg_available(None)
@@ -1180,10 +1344,36 @@ class LaserMicrophoneApp(QMainWindow):
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_layout.setSpacing(5)
         
-        # Add a header for the recordings list
+        # Add a header for the recordings list with version toggle
+        header_layout = QHBoxLayout()
         recordings_header = QLabel("📁 Recorded Audio Files")
         recordings_header.setStyleSheet("font-size: 14px; font-weight: bold; color: #a855f7; padding: 5px;")
-        list_layout.addWidget(recordings_header)
+        header_layout.addWidget(recordings_header)
+        
+        header_layout.addStretch()
+        
+        # Add toggle for original vs processed
+        self.version_toggle = QComboBox()
+        self.version_toggle.addItem("🎵 Original", "original")
+        self.version_toggle.addItem("✨ MATLAB Processed", "processed")
+        self.version_toggle.setCurrentIndex(1)  # Default to processed
+        self.version_toggle.currentIndexChanged.connect(self.on_version_toggle_changed)
+        self.version_toggle.setMaximumWidth(200)
+        header_layout.addWidget(self.version_toggle)
+        
+        # Add MATLAB processing button to header
+        self.matlab_process_btn = QPushButton("✨ MATLAB Process")
+        self.matlab_process_btn.clicked.connect(self.process_selected_with_matlab)
+        self.matlab_process_btn.setMinimumHeight(30)
+        self.matlab_process_btn.setMaximumWidth(150)
+        if not MATLAB_AVAILABLE:
+            self.matlab_process_btn.setEnabled(False)
+            self.matlab_process_btn.setToolTip("MATLAB not available")
+        else:
+            self.matlab_process_btn.setToolTip("Process selected recording through MATLAB")
+        header_layout.addWidget(self.matlab_process_btn)
+        
+        list_layout.addLayout(header_layout)
         
         self.recordings_list = QListWidget()
         self.recordings_list.itemClicked.connect(self.on_recording_selected)
@@ -1248,47 +1438,55 @@ class LaserMicrophoneApp(QMainWindow):
         playback_layout.addLayout(time_layout)
         layout.addWidget(playback_container)
         
-        # Control buttons in one horizontal line
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(8)
-        btn_layout.setContentsMargins(5, 5, 5, 5)
-        
-        upload_btn = QPushButton("📤 Upload")
-        upload_btn.clicked.connect(self.upload_recording)
-        upload_btn.setMinimumHeight(35)
-        btn_layout.addWidget(upload_btn)
+        # Control buttons in two rows for better layout
+        # Row 1: Playback controls
+        playback_btn_layout = QHBoxLayout()
+        playback_btn_layout.setSpacing(8)
+        playback_btn_layout.setContentsMargins(5, 5, 5, 2)
         
         play_btn = QPushButton("▶ Play")
         play_btn.clicked.connect(self.play_recording)
         play_btn.setMinimumHeight(35)
-        btn_layout.addWidget(play_btn)
+        playback_btn_layout.addWidget(play_btn)
         
         pause_btn = QPushButton("⏸ Pause")
         pause_btn.clicked.connect(self.pause_playback)
         pause_btn.setMinimumHeight(35)
-        btn_layout.addWidget(pause_btn)
+        playback_btn_layout.addWidget(pause_btn)
         
         stop_btn = QPushButton("⏹ Stop")
         stop_btn.clicked.connect(self.stop_playback)
         stop_btn.setMinimumHeight(35)
-        btn_layout.addWidget(stop_btn)
+        playback_btn_layout.addWidget(stop_btn)
         
         export_btn = QPushButton("💾 Export")
         export_btn.clicked.connect(self.export_recording)
         export_btn.setMinimumHeight(35)
-        btn_layout.addWidget(export_btn)
+        playback_btn_layout.addWidget(export_btn)
         
         delete_btn = QPushButton("🗑 Delete")
         delete_btn.clicked.connect(self.delete_recording)
         delete_btn.setMinimumHeight(35)
-        btn_layout.addWidget(delete_btn)
+        playback_btn_layout.addWidget(delete_btn)
         
-        transcribe_btn = QPushButton("📝 Transcribe Selected Recording")
+        layout.addLayout(playback_btn_layout)
+        
+        # Row 2: File operations
+        file_btn_layout = QHBoxLayout()
+        file_btn_layout.setSpacing(8)
+        file_btn_layout.setContentsMargins(5, 2, 5, 5)
+        
+        upload_btn = QPushButton("📤 Upload")
+        upload_btn.clicked.connect(self.upload_recording)
+        upload_btn.setMinimumHeight(35)
+        file_btn_layout.addWidget(upload_btn)
+        
+        transcribe_btn = QPushButton("📝 Transcribe")
         transcribe_btn.clicked.connect(self.transcribe_selected)
         transcribe_btn.setMinimumHeight(35)
-        btn_layout.addWidget(transcribe_btn)
+        file_btn_layout.addWidget(transcribe_btn)
         
-        layout.addLayout(btn_layout)
+        layout.addLayout(file_btn_layout)
         
         return tab
     
@@ -1471,19 +1669,19 @@ class LaserMicrophoneApp(QMainWindow):
         start_transcribe_btn.clicked.connect(self.start_transcription)
         btn_layout.addWidget(start_transcribe_btn)
         
-        export_vosk_btn = QPushButton(" 💾 💾 Export Vosk")
+        export_vosk_btn = QPushButton(" 💾 Export Vosk")
         export_vosk_btn.clicked.connect(lambda: self.export_transcription('vosk'))
         btn_layout.addWidget(export_vosk_btn)
         
-        export_sr_btn = QPushButton(" 💾 💾 Export Google SR")
+        export_sr_btn = QPushButton(" 💾 Export Google SR")
         export_sr_btn.clicked.connect(lambda: self.export_transcription('sr'))
         btn_layout.addWidget(export_sr_btn)
         
-        export_whisper_btn = QPushButton(" 💾 💾 Export Whisper")
+        export_whisper_btn = QPushButton(" 💾 Export Whisper")
         export_whisper_btn.clicked.connect(lambda: self.export_transcription('whisper'))
         btn_layout.addWidget(export_whisper_btn)
         
-        export_all_btn = QPushButton(" 💾 💾 Export All")
+        export_all_btn = QPushButton(" 💾 Export All")
         export_all_btn.clicked.connect(lambda: self.export_transcription('all'))
         btn_layout.addWidget(export_all_btn)
         
@@ -1520,6 +1718,14 @@ class LaserMicrophoneApp(QMainWindow):
     def on_filter_changed(self, state):
         """Handle filter checkbox change"""
         self.filter_enabled = state == Qt.CheckState.Checked.value
+    
+    def on_matlab_changed(self, state):
+        """Handle MATLAB checkbox change"""
+        self.matlab_enabled = state == Qt.CheckState.Checked.value
+    
+    def on_version_toggle_changed(self, index):
+        """Handle version toggle change"""
+        self.show_processed = (self.version_toggle.currentData() == "processed")
     
     def on_lowcut_changed(self, value):
         """Handle low cut frequency change"""
@@ -1668,15 +1874,18 @@ class LaserMicrophoneApp(QMainWindow):
         if not os.path.exists(filename):
             QMessageBox.warning(self, "Error", f"Recording file not found: {filename}")
             return
-            
+        
+        # Create base recording data
         recording_data = {
             'name': self.name_input.text().strip() or 'Untitled Recording',
-            'filename': filename,
+            'filename': filename,  # Original recording
+            'processed_filename': None,  # Will be set after MATLAB processing
             'timestamp': datetime.now().isoformat(),
             'duration': self.recording_duration,
             'filtered': self.filter_enabled,
             'lowcut': self.lowcut if self.filter_enabled else None,
             'highcut': self.highcut if self.filter_enabled else None,
+            'matlab_processed': False,
             'vosk_transcription': '',
             'sr_transcription': '',
             'whisper_transcription': ''
@@ -1684,11 +1893,254 @@ class LaserMicrophoneApp(QMainWindow):
         
         self.recordings.append(recording_data)
         print(f"Added new recording: {recording_data['name']}")
-        self.save_recordings()  # This will also update the list
+        
+        # Process through MATLAB if enabled
+        if self.matlab_enabled and MATLAB_AVAILABLE:
+            self.process_recording_with_matlab(filename, recording_data)
+        else:
+            self.save_recordings()
+            self.stats_recordings.setText(f"Total 📁 Recordings: {len(self.recordings)}")
+            QMessageBox.information(self, "Success", f"Recording saved: {filename}")
+            self.name_input.clear()
+    
+    def process_recording_with_matlab(self, original_filename, recording_data):
+        """Process a recording through MATLAB"""
+        try:
+            # Create processed filename
+            base_name = os.path.splitext(original_filename)[0]
+            processed_filename = f"{base_name}_processed.wav"
+            
+            # Show processing dialog
+            self.matlab_progress_msg = QMessageBox(self)
+            self.matlab_progress_msg.setWindowTitle("MATLAB Processing")
+            self.matlab_progress_msg.setText("Processing audio through MATLAB...")
+            self.matlab_progress_msg.setStandardButtons(QMessageBox.StandardButton.NoButton)
+            self.matlab_progress_msg.setModal(False)
+            self.matlab_progress_msg.show()
+            
+            # Start MATLAB processing thread
+            self.matlab_thread = MatlabProcessingThread(
+                original_filename,
+                processed_filename,
+                self.matlab_script_path
+            )
+            self.matlab_thread.processing_complete.connect(
+                lambda pf: self.on_matlab_processing_complete(pf, recording_data)
+            )
+            self.matlab_thread.progress_update.connect(self.on_matlab_progress)
+            self.matlab_thread.error_occurred.connect(self.on_matlab_error)
+            self.matlab_thread.start()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start MATLAB processing: {str(e)}")
+            self.save_recordings()
+            self.stats_recordings.setText(f"Total 📁 Recordings: {len(self.recordings)}")
+    
+    def on_matlab_processing_complete(self, processed_filename, recording_data):
+        """Handle MATLAB processing completion"""
+        # Update original recording data with processed filename link
+        for rec in self.recordings:
+            if rec['filename'] == recording_data['filename']:
+                rec['processed_filename'] = processed_filename
+                rec['matlab_processed'] = True
+                break
+        
+        # Create a new recording entry for the processed file
+        if os.path.exists(processed_filename):
+            try:
+                wf = wave.open(processed_filename, 'rb')
+                duration = wf.getnframes() / wf.getframerate()
+                wf.close()
+                
+                processed_recording = {
+                    'name': recording_data['name'] + ' (MATLAB Processed)',
+                    'filename': processed_filename,
+                    'processed_filename': None,  # This IS the processed version
+                    'timestamp': datetime.now().isoformat(),
+                    'duration': int(duration),
+                    'filtered': recording_data.get('filtered', False),
+                    'lowcut': recording_data.get('lowcut', None),
+                    'highcut': recording_data.get('highcut', None),
+                    'matlab_processed': True,
+                    'vosk_transcription': '',
+                    'sr_transcription': '',
+                    'whisper_transcription': ''
+                }
+                
+                self.recordings.append(processed_recording)
+            except Exception as e:
+                print(f"Warning: Could not create processed recording entry: {e}")
+        
+        self.save_recordings()
+        self.update_recordings_list()  # Refresh the list to show both entries
         self.stats_recordings.setText(f"Total 📁 Recordings: {len(self.recordings)}")
         
-        QMessageBox.information(self, "Success", f"Recording saved: {filename}")
+        # Close progress dialog - do this BEFORE showing success message
+        if hasattr(self, 'matlab_progress_msg'):
+            try:
+                self.matlab_progress_msg.close()
+                self.matlab_progress_msg.deleteLater()
+                del self.matlab_progress_msg
+            except:
+                pass
+        
+        QMessageBox.information(self, "Success", 
+                               f"Recording saved and processed!\n\n"
+                               f"Original: {os.path.basename(recording_data['filename'])}\n"
+                               f"Processed: {os.path.basename(processed_filename)}\n\n"
+                               f"Both files now appear in the recordings list.")
         self.name_input.clear()
+    
+    def on_matlab_progress(self, message):
+        """Update MATLAB processing progress"""
+        if hasattr(self, 'matlab_progress_msg'):
+            self.matlab_progress_msg.setText(message)
+    
+    def on_matlab_error(self, error_msg):
+        """Handle MATLAB processing error"""
+        # Close progress dialog - do this BEFORE showing error message
+        if hasattr(self, 'matlab_progress_msg'):
+            try:
+                self.matlab_progress_msg.close()
+                self.matlab_progress_msg.deleteLater()
+                del self.matlab_progress_msg
+            except:
+                pass
+        
+        QMessageBox.warning(self, "MATLAB Processing Error", 
+                           f"Failed to process audio through MATLAB:\n\n{error_msg}\n\nOriginal recording was saved.")
+        self.save_recordings()
+        self.stats_recordings.setText(f"Total 📁 Recordings: {len(self.recordings)}")
+        if hasattr(self, 'name_input'):
+            self.name_input.clear()
+    
+    def process_selected_with_matlab(self):
+        """Process the selected recording through MATLAB"""
+        if not hasattr(self, 'selected_recording'):
+            QMessageBox.warning(self, "Error", "Please select a recording first")
+            return
+        
+        if not MATLAB_AVAILABLE:
+            QMessageBox.warning(self, "Error", "MATLAB is not available on your system")
+            return
+        
+        # Check if already processed
+        if self.selected_recording.get('matlab_processed', False):
+            reply = QMessageBox.question(
+                self, "Already Processed",
+                f"This recording has already been processed through MATLAB.\n\n"
+                f"Do you want to reprocess it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+        
+        # Get the original filename
+        original_filename = self.selected_recording['filename']
+        
+        if not os.path.exists(original_filename):
+            QMessageBox.warning(self, "Error", "Original recording file not found")
+            return
+        
+        # Create processed filename
+        base_name = os.path.splitext(original_filename)[0]
+        processed_filename = f"{base_name}_processed.wav"
+        
+        # Show processing dialog
+        self.matlab_progress_msg = QMessageBox(self)
+        self.matlab_progress_msg.setWindowTitle("MATLAB Processing")
+        self.matlab_progress_msg.setText("Processing audio through MATLAB...")
+        self.matlab_progress_msg.setStandardButtons(QMessageBox.StandardButton.NoButton)
+        self.matlab_progress_msg.setModal(False)
+        self.matlab_progress_msg.show()
+        
+        # Start MATLAB processing thread
+        self.matlab_thread = MatlabProcessingThread(
+            original_filename,
+            processed_filename,
+            self.matlab_script_path
+        )
+        self.matlab_thread.processing_complete.connect(
+            lambda pf: self.on_manual_matlab_processing_complete(pf, self.selected_recording)
+        )
+        self.matlab_thread.progress_update.connect(self.on_matlab_progress)
+        self.matlab_thread.error_occurred.connect(self.on_manual_matlab_error)
+        self.matlab_thread.start()
+    
+    def on_manual_matlab_processing_complete(self, processed_filename, recording_data):
+        """Handle MATLAB processing completion for manually processed recordings"""
+        # Update original recording data with processed filename link
+        for rec in self.recordings:
+            if rec['filename'] == recording_data['filename']:
+                rec['processed_filename'] = processed_filename
+                rec['matlab_processed'] = True
+                break
+        
+        # Check if processed file already exists as a separate entry (reprocessing case)
+        processed_entry_exists = False
+        for rec in self.recordings:
+            if rec['filename'] == processed_filename:
+                processed_entry_exists = True
+                # Update the existing processed entry's timestamp
+                rec['timestamp'] = datetime.now().isoformat()
+                break
+        
+        # Create a new recording entry for the processed file if it doesn't exist
+        if not processed_entry_exists and os.path.exists(processed_filename):
+            try:
+                wf = wave.open(processed_filename, 'rb')
+                duration = wf.getnframes() / wf.getframerate()
+                wf.close()
+                
+                processed_recording = {
+                    'name': recording_data['name'] + ' (MATLAB Processed)',
+                    'filename': processed_filename,
+                    'processed_filename': None,  # This IS the processed version
+                    'timestamp': datetime.now().isoformat(),
+                    'duration': int(duration),
+                    'filtered': recording_data.get('filtered', False),
+                    'lowcut': recording_data.get('lowcut', None),
+                    'highcut': recording_data.get('highcut', None),
+                    'matlab_processed': True,
+                    'vosk_transcription': '',
+                    'sr_transcription': '',
+                    'whisper_transcription': ''
+                }
+                
+                self.recordings.append(processed_recording)
+            except Exception as e:
+                print(f"Warning: Could not create processed recording entry: {e}")
+        
+        self.save_recordings()
+        self.update_recordings_list()  # Refresh the list to show both entries
+        
+        # Close progress dialog - do this BEFORE showing success message
+        if hasattr(self, 'matlab_progress_msg'):
+            try:
+                self.matlab_progress_msg.close()
+                self.matlab_progress_msg.deleteLater()
+                del self.matlab_progress_msg
+            except:
+                pass
+        
+        QMessageBox.information(self, "Success", 
+                               f"Recording processed successfully!\n\n"
+                               f"Processed file: {os.path.basename(processed_filename)}\n\n"
+                               f"The processed file now appears in the recordings list.")
+    
+    def on_manual_matlab_error(self, error_msg):
+        """Handle MATLAB processing error for manually processed recordings"""
+        # Close progress dialog - do this BEFORE showing error message
+        if hasattr(self, 'matlab_progress_msg'):
+            try:
+                self.matlab_progress_msg.close()
+                self.matlab_progress_msg.deleteLater()
+                del self.matlab_progress_msg
+            except:
+                pass
+        
+        QMessageBox.warning(self, "MATLAB Processing Error", 
+                           f"Failed to process audio through MATLAB:\n\n{error_msg}")
     
     def on_error(self, error_msg):
         """Handle errors"""
@@ -1783,6 +2235,10 @@ class LaserMicrophoneApp(QMainWindow):
                     highcut = rec.get('highcut', 0)
                     item_text += f" • 🔊 {lowcut}-{highcut}Hz"
                 
+                # Add indicator if MATLAB processed
+                if rec.get('matlab_processed', False):
+                    item_text += " • ✨ MATLAB"
+                
                 item = QListWidgetItem(item_text)
                 # Store the original recording data with normalized filename
                 rec_copy = rec.copy()
@@ -1823,11 +2279,13 @@ class LaserMicrophoneApp(QMainWindow):
                 recording_data = {
                     'name': base_name,
                     'filename': new_filename,
+                    'processed_filename': None,
                     'timestamp': datetime.now().isoformat(),
                     'duration': int(duration),
                     'filtered': False,
                     'lowcut': None,
                     'highcut': None,
+                    'matlab_processed': False,
                     'vosk_transcription': '',
                     'sr_transcription': '',
                     'whisper_transcription': ''
@@ -1838,7 +2296,23 @@ class LaserMicrophoneApp(QMainWindow):
                 self.update_recordings_list()
                 self.stats_recordings.setText(f"Total 📁 Recordings: {len(self.recordings)}")
                 
-                QMessageBox.information(self, "Success", f"Recording uploaded: {base_name}")
+                # Ask if user wants to process through MATLAB
+                if MATLAB_AVAILABLE:
+                    reply = QMessageBox.question(
+                        self, "Process with MATLAB?",
+                        f"Recording uploaded successfully!\n\n"
+                        f"Would you like to process it through MATLAB now?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.Yes:
+                        # Select the newly uploaded recording and process it
+                        self.selected_recording = recording_data
+                        self.process_selected_with_matlab()
+                    else:
+                        QMessageBox.information(self, "Success", f"Recording uploaded: {base_name}")
+                else:
+                    QMessageBox.information(self, "Success", f"Recording uploaded: {base_name}")
             
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to upload recording: {str(e)}")
@@ -1850,11 +2324,19 @@ class LaserMicrophoneApp(QMainWindow):
             return
         
         try:
-            file_path = self.selected_recording['filename']
+            # Choose which version to play based on toggle
+            if self.show_processed and self.selected_recording.get('processed_filename'):
+                file_path = self.selected_recording['processed_filename']
+                version = "processed"
+            else:
+                file_path = self.selected_recording['filename']
+                version = "original"
+            
             if not os.path.exists(file_path):
-                QMessageBox.warning(self, "Error", "Recording file not found")
+                QMessageBox.warning(self, "Error", f"Recording file not found: {file_path}")
                 return
             
+            print(f"Playing {version} version: {file_path}")
             self.media_player.setSource(QUrl.fromLocalFile(file_path))
             self.media_player.play()
             self.is_playing = True
@@ -1923,15 +2405,25 @@ class LaserMicrophoneApp(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select a recording")
             return
         
+        # Choose which version to export based on toggle
+        if self.show_processed and self.selected_recording.get('processed_filename'):
+            source_file = self.selected_recording['processed_filename']
+            default_name = self.selected_recording['name'] + "_processed.wav"
+            version = "processed"
+        else:
+            source_file = self.selected_recording['filename']
+            default_name = self.selected_recording['name'] + "_original.wav"
+            version = "original"
+        
         filename, _ = QFileDialog.getSaveFileName(
             self, "💾 Export Recording", 
-            self.selected_recording['name'] + ".wav",
+            default_name,
             "WAV Files (*.wav)"
         )
         
         if filename:
-            shutil.copy(self.selected_recording['filename'], filename)
-            QMessageBox.information(self, "Success", f"💾 Exported to: {filename}")
+            shutil.copy(source_file, filename)
+            QMessageBox.information(self, "Success", f"💾 Exported {version} version to: {filename}")
     
     def delete_recording(self):
         """🗑 Delete selected recording"""
@@ -1941,13 +2433,18 @@ class LaserMicrophoneApp(QMainWindow):
         
         reply = QMessageBox.question(
             self, "Confirm 🗑 Delete",
-            f"🗑 Delete recording: {self.selected_recording['name']}?",
+            f"🗑 Delete recording: {self.selected_recording['name']}?\n\nThis will delete both original and processed versions.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         
         if reply == QMessageBox.StandardButton.Yes:
+            # Delete original file
             if os.path.exists(self.selected_recording['filename']):
                 os.remove(self.selected_recording['filename'])
+            
+            # Delete processed file if it exists
+            if self.selected_recording.get('processed_filename') and os.path.exists(self.selected_recording['processed_filename']):
+                os.remove(self.selected_recording['processed_filename'])
             
             self.recordings = [r for r in self.recordings 
                              if r['filename'] != self.selected_recording['filename']]
@@ -1968,14 +2465,22 @@ class LaserMicrophoneApp(QMainWindow):
             return
         
         try:
-            sample_rate, data = wavfile.read(self.selected_recording['filename'])
+            # Choose which version to visualize based on toggle
+            if self.show_processed and self.selected_recording.get('processed_filename'):
+                file_path = self.selected_recording['processed_filename']
+                version = "processed"
+            else:
+                file_path = self.selected_recording['filename']
+                version = "original"
+            
+            sample_rate, data = wavfile.read(file_path)
             
             self.waveform_canvas.axes.clear()
             time = np.arange(len(data)) / sample_rate
             self.waveform_canvas.axes.plot(time, data, color='#a855f7', linewidth=0.5)
             self.waveform_canvas.axes.set_xlabel('Time (s)', color='white')
             self.waveform_canvas.axes.set_ylabel('Amplitude', color='white')
-            self.waveform_canvas.axes.set_title('Waveform', color='white')
+            self.waveform_canvas.axes.set_title(f'Waveform ({version.capitalize()})', color='white')
             self.waveform_canvas.axes.tick_params(colors='white')
             self.waveform_canvas.axes.grid(True, alpha=0.3)
             self.waveform_canvas.draw()
@@ -1986,11 +2491,11 @@ class LaserMicrophoneApp(QMainWindow):
                                                     shading='gouraud', cmap='viridis')
             self.spectrogram_canvas.axes.set_ylabel('Frequency (Hz)', color='white')
             self.spectrogram_canvas.axes.set_xlabel('Time (s)', color='white')
-            self.spectrogram_canvas.axes.set_title('Spectrogram', color='white')
+            self.spectrogram_canvas.axes.set_title(f'Spectrogram ({version.capitalize()})', color='white')
             self.spectrogram_canvas.axes.tick_params(colors='white')
             self.spectrogram_canvas.draw()
             
-            QMessageBox.information(self, "Success", "Visualization complete!")
+            QMessageBox.information(self, "Success", f"Visualization complete! ({version.capitalize()} version)")
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Visualization error: {str(e)}")
